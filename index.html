@@ -609,11 +609,9 @@ async function fetchJsonPoints(url) {
   } catch {}
   return [];
 }
-// Real positions from free sources: what the snapshot job recorded, plus the
-// volunteer networks' full track for today (which usually includes takeoff).
+// Real positions recorded by the snapshot job (every 5 minutes, up to 20 hours back).
 async function fetchTrack(hex) {
-  const [mine, today] = await Promise.all([fetchJsonPoints(`${API_TRACK}?hex=${hex}`), fetchJsonPoints(`/api/trace?hex=${hex}`)]);
-  return mergeTracks(mine, today);
+  return fetchJsonPoints(`${API_TRACK}?hex=${hex}`);
 }
 // Recorded history can include the aircraft's previous flight. Keep only this one:
 // from takeoff if FlightAware says when, otherwise from its last pass near the origin.
