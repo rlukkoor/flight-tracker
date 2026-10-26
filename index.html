@@ -51,6 +51,9 @@ button.tog{font:inherit;font-size:12.5px}
 #info.open{display:block}
 .ihead{padding:14px 14px 10px;position:relative;border-bottom:1px solid var(--line)}
 .ihead .cs{font-size:22px;font-weight:700;letter-spacing:.01em}
+.ihead .cs .iata{font-size:14px;font-weight:600;color:var(--muted)}
+.ihead .logo{display:block;height:30px;max-width:150px;object-fit:contain;object-position:left;margin-bottom:8px;background:#fff;border-radius:6px;padding:3px 6px}
+.tm .late{color:var(--warn)}
 .ihead .al{color:var(--muted);margin-top:1px}
 .close{position:absolute;top:10px;right:10px;width:28px;height:28px;border-radius:50%;border:1px solid var(--line);background:var(--chip);
   color:var(--text);cursor:pointer;font-size:15px;line-height:1}
@@ -127,10 +130,13 @@ button.tog{font:inherit;font-size:12.5px}
 const CARTO_KEY = "cb1_3o6i_4_e9b184ad467134017db51332";
 const API_STATES = "/api/states";
 const API_LOOKUP = "/api/lookup";
+const API_FLIGHT = "/api/flight";
 const ADSBDB = "https://api.adsbdb.com/v0/";
 const REGIONAL = [
   { name: "adsb.lol",       url: (la, lo, r) => `https://api.adsb.lol/v2/point/${la}/${lo}/${r}` },
   { name: "airplanes.live", url: (la, lo, r) => `https://api.airplanes.live/v2/point/${la}/${lo}/${r}` },
+  // Same feeds fetched by your own site, for when the browser can't reach them directly.
+  { name: "site relay", url: (la, lo, r) => `/api/live?lat=${la}&lon=${lo}&r=${r}`, relay: true },
 ];
 const REGIONAL_MIN_ZOOM = 6;
 const REGIONAL_EVERY = 5000;
@@ -445,6 +451,7 @@ async function loadRegional() {
   let done = false, limited = false;
   for (let k = 0; k < REGIONAL.length && !done; k++) {
     const i = (rMeta.pref + k) % REGIONAL.length, src = REGIONAL[i];
+    if (src.dead) continue;
     const ac = new AbortController(), to = setTimeout(() => ac.abort(), 8000);
     try {
       const res = await fetch(src.url(la, lo, r), { signal: ac.signal, cache: "no-store" });
@@ -452,9 +459,11 @@ async function loadRegional() {
       if (!res.ok) throw new Error("HTTP " + res.status);
       const d = await res.json();
       ingestLive(d);
-      Object.assign(rMeta, { ok: true, at: Date.now(), src: src.name, err: "", fails: 0, pref: i, count: (d.ac || []).length });
+      Object.assign(rMeta, { ok: true, at: Date.now(), src: d.src ? `${d.src} via your site` : src.name, err: "", fails: 0, pref: i, count: (d.ac || []).length });
       done = true;
     } catch (e) {
+      // A TypeError from fetch means the browser blocked it (CORS or a blocker); skip that source from now on.
+      if (e instanceof TypeError && !src.relay) src.dead = true;
       rMeta.err = String(e.name === "AbortError" ? "timed out" : e.message || e);
     } finally { clearTimeout(to); }
   }
@@ -610,6 +619,10 @@ map.on("moveend", () => updateSelectionGraphics(planes.get(ui.selected)));
 const ROUTES_CDN = "https://cdn.jsdelivr.net/gh/GumDropSoftware/overhead-routes";
 let airportsP = null, routesBaseP = null, routesCaution = null;
 const airlineRoutes = new Map();
+let airlinesP = null;
+function loadAirlines() {
+  return (airlinesP ||= fetch("airlines.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
+}
 function loadAirports() {
   return (airportsP ||= fetch("airports.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
 }
@@ -659,10 +672,22 @@ async function fetchLookup(p) {
     const [route, aircraft] = await Promise.all([cs ? g("callsign/" + cs) : null, g("aircraft/" + p.hex)]);
     return { route, aircraft };
   })();
-  const [raw, seen, apts] = await Promise.all([adsbdb, cs && isAirline(cs) ? observedRoutes(cs) : [], loadAirports()]);
+  const fa = cs && isAirline(cs)
+    ? fetch(`${API_FLIGHT}?cs=${encodeURIComponent(cs)}`).then((r) => ((r.headers.get("content-type") || "").includes("json") ? r.json() : null)).catch(() => null)
+    : null;
+  const [raw, seen, apts, als, faRes] = await Promise.all([adsbdb, cs && isAirline(cs) ? observedRoutes(cs) : [], loadAirports(), loadAirlines(), fa]);
   const out = normalize(raw);
+  out.fa = faRes?.flight || null;
+  out.faStatus = faRes ? (faRes.limited ? "limited" : faRes.enabled ? "on" : "off") : "off";
+  const al = als[(cs || "").slice(0, 3)];
+  out.logoIata = out.fa?.operatorIata || out.airline?.iata || (al && al[0]) || "";
+  out.airlineName = out.airline?.name || (al && al[1]) || "";
   const apt = (icao) => { const a = apts[icao]; return a && { icao, iata: a[0], name: a[1], city: a[2], country: a[3], lat: a[4], lon: a[5] }; };
   out.cands = [];
+  if (out.fa?.origin?.icao && out.fa?.destination?.icao) {
+    const o = apt(out.fa.origin.icao), d = apt(out.fa.destination.icao);
+    if (o && d) out.cands.push({ o: { ...o, tz: out.fa.origin.tz }, d: { ...d, tz: out.fa.destination.tz }, src: "fa", days: 0 });
+  }
   for (const s of seen) {
     const o = apt(s.o), d = apt(s.d);
     if (o && d) out.cands.push({ o, d, src: "seen", days: s.days, takeoff: s.takeoff });
@@ -712,7 +737,7 @@ function chooseLeg(p) {
   for (const leg of c) {
     const xt = legFit(p, leg.o, leg.d);
     if (xt == null) continue;
-    const score = (leg.src === "seen" ? 1e6 : 0) + leg.days * 1e3 - xt;
+    const score = (leg.src === "fa" ? 2e6 : leg.src === "seen" ? 1e6 : 0) + leg.days * 1e3 - xt;
     if (!best || score > best.score) best = { ...leg, score };
   }
   return best;
@@ -766,17 +791,57 @@ function legTimes(p, leg) {
   }
   return out;
 }
-function depHtml(t) {
+// FlightAware data, when the AeroAPI key is set and its route matches the chosen leg.
+function faFor(p) {
+  const fa = p.lk?.fa, leg = p.leg;
+  return fa && leg && fa.origin?.icao === leg.o.icao && fa.destination?.icao === leg.d.icao ? fa : null;
+}
+function fmtAt(iso, tz) {
+  const d = new Date(iso);
+  try { return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: tz, timeZoneName: "short" }); }
+  catch { return fmtTime(d.getTime()); }
+}
+function timeLine(label, iso, tz, sched) {
+  const late = sched && Date.parse(iso) - Date.parse(sched) > 15 * 60000;
+  return `${label} <b${late ? ' class="late"' : ""}>${fmtAt(iso, tz)}</b>`;
+}
+function gateLine(term, gate) {
+  return [term && `Terminal ${esc(term)}`, gate && `Gate ${esc(gate)}`].filter(Boolean).join(", ");
+}
+function depHtml(p, t) {
+  const fa = faFor(p);
+  if (fa) {
+    const tz = fa.origin.tz, rows = [];
+    if (fa.out.act) rows.push(timeLine("Departed", fa.out.act, tz, fa.out.sched));
+    else if (fa.out.est) rows.push(timeLine("Departs", fa.out.est, tz, fa.out.sched));
+    if (fa.out.sched) rows.push(`Scheduled ${fmtAt(fa.out.sched, tz)}`);
+    if (fa.off.act) rows.push(`Took off ${fmtAt(fa.off.act, tz)}`);
+    const g = gateLine(fa.termOrigin, fa.gateOrigin);
+    if (g) rows.push(g);
+    return rows.join("<br>");
+  }
   const rows = [];
   if (t.typical) rows.push(`Usually departs <b>${fmtTime(t.typical)}</b>`);
   if (t.tookOff) rows.push(`Took off <b>${fmtTime(t.tookOff)}</b>`);
   return rows.join("<br>");
 }
 function arrHtml(p, t) {
+  const fa = faFor(p);
+  if (fa) {
+    const tz = fa.destination.tz, rows = [];
+    if (fa.in.act) rows.push(timeLine("Arrived", fa.in.act, tz, fa.in.sched));
+    else if (fa.on.act) rows.push(timeLine("Landed", fa.on.act, tz, fa.on.sched));
+    else if (fa.in.est) rows.push(timeLine("Arrives", fa.in.est, tz, fa.in.sched) + `<br>in ${fmtDur(Date.parse(fa.in.est) - Date.now())}`);
+    if (fa.in.sched) rows.push(`Scheduled ${fmtAt(fa.in.sched, tz)}`);
+    const g = gateLine(fa.termDest, fa.gateDest);
+    if (g) rows.push(g);
+    return rows.join("<br>");
+  }
   if (p.gnd) return "On the ground";
   return t.eta ? `Est. arrival <b>${fmtTime(t.eta)}</b><br>in ${fmtDur(t.eta - Date.now())}` : "";
 }
 function legSource(leg) {
+  if (leg.src === "fa") return "Schedule, times and gates from FlightAware, local to each airport.";
   if (leg.src === "adsbdb") return "From the adsbdb callsign database, not confirmed by recent flights.";
   const caution = routesCaution === "schedule-change" ? " Airline schedules changed this week, so treat it with some caution." : "";
   return `Flown on this route ${leg.days} of the last 7 days.${caution}`;
@@ -785,7 +850,9 @@ function legSource(leg) {
 function renderInfo(p) {
   const lk = p.lk;
   if (lk) p.leg = chooseLeg(p);
-  const airline = lk?.airline?.name || (isAirline(p.cs) ? "" : (p.cs ? "Private or other operator" : ""));
+  const airline = lk?.airlineName || (isAirline(p.cs) ? "" : (p.cs ? "Private or other operator" : ""));
+  const logo = lk?.logoIata ? `<img class="logo" src="https://pics.avs.io/240/80/${encodeURIComponent(lk.logoIata)}.png" alt="${esc(airline || lk.logoIata)} logo" referrerpolicy="no-referrer"
+      onerror="if(!this.dataset.f){this.dataset.f=1;this.src='https://images.kiwi.com/airlines/64/${encodeURIComponent(lk.logoIata)}.png'}else{this.remove()}">` : "";
   const photo = lk?.aircraft?.thumb || lk?.aircraft?.photo;
   const plane = "M0,-9 L1.3,-7.4 L1.5,-2.6 L8.5,1.6 L8.5,3.2 L1.5,1.2 L1.1,6 L3.6,7.9 L3.6,9 L0,8.1 L-3.6,9 L-3.6,7.9 L-1.1,6 L-1.5,1.2 L-8.5,3.2 L-8.5,1.6 L-1.5,-2.6 L-1.3,-7.4 Z";
   let route = "";
@@ -793,12 +860,12 @@ function renderInfo(p) {
   else if (p.leg) {
     const leg = p.leg, rc = routeProgress(p, leg), tm = legTimes(p, leg);
     route = `<div class="route">
-      <div class="ap"><div><div class="code">${apLabel(leg.o)}</div><div class="city" title="${esc(leg.o.name)}">${apCity(leg.o)}</div><div class="tm" id="tdep">${depHtml(tm)}</div></div>
+      <div class="ap"><div><div class="code">${apLabel(leg.o)}</div><div class="city" title="${esc(leg.o.name)}">${apCity(leg.o)}</div><div class="tm" id="tdep">${depHtml(p, tm)}</div></div>
       <div class="r"><div class="code">${apLabel(leg.d)}</div><div class="city" title="${esc(leg.d.name)}">${apCity(leg.d)}</div><div class="tm" id="tarr">${arrHtml(p, tm)}</div></div></div>
       <div class="prog" id="prog"><i style="width:${(rc.frac * 100).toFixed(1)}%"></i>
         <svg class="pl" style="left:${(rc.frac * 100).toFixed(1)}%" viewBox="-10 -10 20 20"><path transform="rotate(90)" fill="currentColor" d="${plane}"/></svg></div>
       <div class="note" id="rnote">${nf(rc.done)} nm flown, ${nf(rc.left)} nm to go</div>
-      <div class="note">${legSource(leg)} Times are in your time zone.</div>
+      <div class="note">${legSource(leg)}${leg.src === "fa" ? "" : " Times are in your time zone."}${lk.faStatus === "limited" ? " FlightAware's daily lookup limit was reached, so these are estimates." : ""}</div>
     </div>`;
   } else if (lk.cands.length) {
     const c = lk.cands[0];
@@ -808,7 +875,8 @@ function renderInfo(p) {
   info.innerHTML = `
     <div class="ihead">
       <button class="close" id="xclose" aria-label="Close">&times;</button>
-      <div class="cs">${esc(p.cs || p.hex.toUpperCase())}</div>
+      ${logo}
+      <div class="cs">${esc(p.cs || p.hex.toUpperCase())}${lk?.fa?.identIata ? ` <span class="iata">${esc(lk.fa.identIata)}</span>` : ""}</div>
       <div class="al">${esc(airline) || "&nbsp;"}</div>
     </div>
     ${photo ? `<img class="photo" src="${esc(photo)}" alt="Photo of ${esc(lk?.aircraft?.reg || "aircraft")}" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ""}
