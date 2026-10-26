@@ -3,9 +3,15 @@
 // AeroAPI. Only runs when the AEROAPI_KEY secret is set; otherwise the page
 // falls back to its own estimates.
 //
-// Cost control: answers are cached 10 minutes per callsign, and upstream calls
-// are capped per day (AEROAPI_DAILY_LIMIT, default 30, counted in FLIGHTS_KV).
-// At about $0.005 a call, 30 a day stays inside the Personal tier's free $5.
+// Cost control, so usage stays inside the Personal tier's free $5 a month:
+//   * answers are cached 15 minutes per callsign, so repeat clicks are free
+//   * one page of results per call (max_pages=1), about $0.005 each
+//   * a monthly ceiling (AEROAPI_MONTHLY_LIMIT, default 900 calls, about $4.50,
+//     leaving room for the few calls KV's eventual consistency can let through)
+//   * a daily limit (AEROAPI_DAILY_LIMIT, default 30) so one busy day can't use
+//     up the whole month
+// Usage is counted in FLIGHTS_KV under one key. Without that binding, no calls
+// are made at all, since there would be no way to enforce the ceiling.
 
 const BASE = "https://aeroapi.flightaware.com/aeroapi";
 
@@ -47,14 +53,17 @@ export async function onRequestGet(context) {
     if (hit) return hit;
   } catch {}
 
-  // Daily cap, so a busy day can't run up a bill.
-  const limit = Number(env.AEROAPI_DAILY_LIMIT) || 30;
-  const dayKey = `aero:${new Date().toISOString().slice(0, 10)}`;
-  let used = 0;
-  if (env.FLIGHTS_KV) {
-    used = Number(await env.FLIGHTS_KV.get(dayKey)) || 0;
-    if (used >= limit) return json({ enabled: true, limited: true });
-  }
+  // Usage limits. Months and days are counted in UTC, the same way AeroAPI bills.
+  if (!env.FLIGHTS_KV) return json({ enabled: true, error: "FLIGHTS_KV binding missing, so usage can't be capped" });
+  const monthly = Number(env.AEROAPI_MONTHLY_LIMIT) || 900;
+  const daily = Number(env.AEROAPI_DAILY_LIMIT) || 30;
+  const today = new Date().toISOString().slice(0, 10), month = today.slice(0, 7);
+  let u = {};
+  try { u = JSON.parse((await env.FLIGHTS_KV.get("aero-usage")) || "{}"); } catch {}
+  if (u.month !== month) u = { month, m: 0, day: today, d: 0 };
+  if (u.day !== today) { u.day = today; u.d = 0; }
+  if (u.m >= monthly) return json({ enabled: true, limited: "month" });
+  if (u.d >= daily) return json({ enabled: true, limited: "day" });
 
   let r;
   try {
@@ -64,7 +73,8 @@ export async function onRequestGet(context) {
   } catch (e) {
     return json({ enabled: true, error: `FlightAware unreachable (${e.message})` });
   }
-  if (env.FLIGHTS_KV) context.waitUntil(env.FLIGHTS_KV.put(dayKey, String(used + 1), { expirationTtl: 172800 }));
+  u.m++; u.d++;
+  context.waitUntil(env.FLIGHTS_KV.put("aero-usage", JSON.stringify(u)));
   if (!r.ok) return json({ enabled: true, error: `FlightAware returned ${r.status}` });
 
   const f = pick((await r.json()).flights || []);
@@ -78,7 +88,7 @@ export async function onRequestGet(context) {
     in: { sched: f.scheduled_in, est: f.estimated_in, act: f.actual_in },
     depDelay: f.departure_delay, arrDelay: f.arrival_delay,
   };
-  const res = json({ enabled: true, flight: flight || null }, 600);
+  const res = json({ enabled: true, flight: flight || null }, 900);
   if (cache) context.waitUntil(cache.put(key, res.clone()).catch(() => {}));
   return res;
 }

@@ -702,6 +702,7 @@ async function fetchLookup(p) {
   const out = normalize(raw);
   out.fa = faRes?.flight || null;
   out.faStatus = faRes ? (faRes.limited ? "limited" : faRes.enabled ? "on" : "off") : "off";
+  out.faLimit = faRes?.limited || null;
   const al = als[(cs || "").slice(0, 3)];
   out.logoIata = out.fa?.operatorIata || out.airline?.iata || (al && al[0]) || "";
   out.airlineName = out.airline?.name || (al && al[1]) || "";
@@ -901,7 +902,7 @@ function renderInfo(p) {
       <div class="prog" id="prog"><i style="width:${(rc.frac * 100).toFixed(1)}%"></i>
         <svg class="pl" style="left:${(rc.frac * 100).toFixed(1)}%" viewBox="-10 -10 20 20"><path transform="rotate(90)" fill="currentColor" d="${plane}"/></svg></div>
       <div class="note" id="rnote">${nf(rc.done)} nm flown, ${nf(rc.left)} nm to go</div>
-      <div class="note">${legSource(leg)}${leg.src === "fa" ? "" : " Times are in your time zone."}${lk.faStatus === "limited" ? " FlightAware's daily lookup limit was reached, so these are estimates." : ""}</div>
+      <div class="note">${legSource(leg)}${leg.src === "fa" ? "" : " Times are in your time zone."}${lk.faStatus === "limited" ? ` FlightAware's ${lk.faLimit === "month" ? "monthly" : "daily"} lookup limit was reached, so these are estimates.` : ""}</div>
     </div>`;
   } else {
     const c = lk.cands[0], io = inferOrigin(p);
