@@ -1,0 +1,30 @@
+name: OpenSky snapshot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # GitHub's minimum; runs are often a few minutes late
+  workflow_dispatch: # lets you run it by hand from the Actions tab
+
+concurrency:
+  group: opensky-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch OpenSky and store in Cloudflare KV
+        run: node .github/scripts/snapshot.mjs
+        env:
+          OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
+          OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
