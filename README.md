@@ -6,7 +6,7 @@ Live global map of commercial flights.
 index.html                              the app
 functions/api/states.js                 serves the latest global snapshot from KV
 functions/api/lookup.js                 aircraft details and fallback routes (adsbdb), cached 6 hours
-functions/api/track.js                  last 4 hours of positions for one aircraft, from KV
+functions/api/track.js                  up to 20 hours of positions for one aircraft, from KV
 airports.json                           airport names and coordinates (OurAirports), loaded on first click
 favicon.svg, apple-touch-icon.png       site icons
 .github/workflows/opensky-snapshot.yml  runs every 5 minutes on GitHub

@@ -1,5 +1,5 @@
 // Cloudflare Pages Function: GET /api/track?hex=a1b2c3
-// Returns up to 4 hours of positions for one aircraft from the track history
+// Returns up to 20 hours of positions for one aircraft from the track history
 // the GitHub Action keeps in KV: { points: [[epochSeconds, lat, lon], ...] }
 
 let txt = null;

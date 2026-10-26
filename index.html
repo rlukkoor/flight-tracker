@@ -508,7 +508,7 @@ function prune() {
 
 /* ---------- selection, route and info panel ---------- */
 const info = $("#info");
-let routeLayer = null, trailLine = null, remainLine = null;
+let routeLayer = null, trailLine = null, remainLine = null, gapLine = null;
 const API_TRACK = "/api/track";
 function pushTrail(p) {
   p.trail ||= [];
@@ -536,8 +536,20 @@ function updateSelectionGraphics(p) {
   if (trailLine) {
     const histEnd = p.hist?.length ? p.hist[p.hist.length - 1][0] : 0;
     const pts = [...(p.hist || []).map((h) => [h[1], h[2]]), ...(p.trail || []).filter((_, i) => i > 0 || !histEnd), [la, lo]];
+    // Start the track at the origin airport when it reaches back there.
+    // Otherwise mark the untracked stretch with a faint dotted line.
+    const o = p.leg?.o;
+    const reachesOrigin = o && distNm(pts[0][0], pts[0][1], o.lat, o.lon) < 80;
+    if (reachesOrigin) pts.unshift([o.lat, o.lon]);
     const u = unwrap(pts), last = u[u.length - 1], k = here[1] - last[1];
-    trailLine.setLatLngs(u.map(([a, b]) => [a, b + k]));
+    const trail = u.map(([a, b]) => [a, b + k]);
+    trailLine.setLatLngs(trail);
+    if (gapLine) {
+      if (o && !reachesOrigin) {
+        const gc = greatCircle([o.lat, o.lon], trail[0], 48), g = trail[0][1] - gc[gc.length - 1][1];
+        gapLine.setLatLngs(gc.map(([a, b]) => [a, b + g]));
+      } else gapLine.setLatLngs([]);
+    }
   }
   if (remainLine && p.leg) {
     const gc = greatCircle(here, [p.leg.d.lat, p.leg.d.lon], 64);
@@ -574,7 +586,7 @@ function select(hex, fly) {
   fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; renderInfo(p); drawRoute(p); } });
 }
 function clearSelectionLayers() {
-  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; }
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; }
   if (trailLine) { map.removeLayer(trailLine); trailLine = null; }
 }
 function deselect() {
@@ -707,14 +719,15 @@ function chooseLeg(p) {
 }
 
 function drawRoute(p) {
-  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; }
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; }
   const leg = p.leg;
   if (!leg) return;
   const col = ui.dark ? "#6ea0ff" : "#2563eb";
   const ref = shiftNear(p.lon, map.getCenter().lng);
   remainLine = L.polyline([], { color: col, weight: 1.6, opacity: 0.75, dashArray: "5 6", interactive: false });
+  gapLine = L.polyline([], { color: col, weight: 1.6, opacity: 0.4, dashArray: "1 6", lineCap: "round", interactive: false });
   routeLayer = L.layerGroup([
-    remainLine,
+    remainLine, gapLine,
     L.circleMarker([leg.o.lat, shiftNear(leg.o.lon, ref)], { radius: 4, color: col, weight: 2, fillColor: "#fff", fillOpacity: 1, interactive: false }),
     L.circleMarker([leg.d.lat, shiftNear(leg.d.lon, ref)], { radius: 4, color: col, weight: 2, fillColor: col, fillOpacity: 1, interactive: false }),
   ]).addTo(map);
@@ -746,7 +759,7 @@ function legTimes(p, leg) {
     out.typical = t;
   }
   const f = p.hist?.[0];
-  if (f && distNm(f[1], f[2], leg.o.lat, leg.o.lon) < 60 && Date.now() / 1000 - f[0] < 3.8 * 3600) out.tookOff = f[0] * 1000;
+  if (f && distNm(f[1], f[2], leg.o.lat, leg.o.lon) < 60 && Date.now() / 1000 - f[0] < 19.8 * 3600) out.tookOff = f[0] * 1000;
   if (!p.gnd && p.gs > 100) {
     const [la, lo] = curPos(p, Date.now() / 1000);
     out.eta = Date.now() + (distNm(la, lo, leg.d.lat, leg.d.lon) / p.gs) * 3600e3;
