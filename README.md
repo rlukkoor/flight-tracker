@@ -5,9 +5,12 @@ Live global map of commercial flights.
 ```
 index.html                              the app
 functions/api/states.js                 serves the latest global snapshot from KV
-functions/api/lookup.js                 route and aircraft lookup (adsbdb), cached 6 hours
+functions/api/lookup.js                 aircraft details and fallback routes (adsbdb), cached 6 hours
+functions/api/track.js                  last 4 hours of positions for one aircraft, from KV
+airports.json                           airport names and coordinates (OurAirports), loaded on first click
+favicon.svg, apple-touch-icon.png       site icons
 .github/workflows/opensky-snapshot.yml  runs every 5 minutes on GitHub
-.github/scripts/snapshot.mjs            fetches OpenSky, writes the snapshot to KV
+.github/scripts/snapshot.mjs            fetches OpenSky + adsb.fi, writes snapshot and track history to KV
 ```
 
 OpenSky doesn't answer Cloudflare's servers and doesn't allow browser requests from other sites, so a scheduled GitHub Action fetches it and stores the result in Cloudflare KV. The site reads from there. When you zoom in, a separate live feed (adsb.lol, airplanes.live) updates every 5 seconds straight from the browser.
@@ -29,5 +32,7 @@ OpenSky doesn't answer Cloudflare's servers and doesn't allow browser requests f
 * GitHub runs scheduled jobs on a best effort basis, so snapshots can arrive a few minutes late. Planes keep moving along their heading in between.
 * GitHub pauses scheduled workflows in public repos after 60 days with no commits. Push any small change, or re enable it from the Actions tab.
 * Credits: 288 OpenSky calls a day at 4 credits each uses about 1,150 of your 4,000.
+* Each run also makes about 70 adsb.fi queries, paced at one per second as its terms require, to fill regions OpenSky covers thinly. No free source covers mid ocean.
+* KV: each run writes two keys (snapshot, tracks), about 580 writes a day against the free tier's 1,000.
 * Data sources are free for non commercial use. Check each provider's terms before using it inside a business product.
 * URLs are shareable: `#zoom/lat/lon/hex` restores the view and selected plane.

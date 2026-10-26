@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Live Flight Tracker</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#1e3a8a">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 :root{
@@ -58,6 +61,8 @@ button.tog{font:inherit;font-size:12.5px}
 .ap .code{font-size:20px;font-weight:700}
 .ap .city{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ap .r{text-align:right}
+.tm{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.35}
+.tm b{color:var(--text);font-weight:600}
 .prog{position:relative;height:4px;background:var(--line);border-radius:2px;margin:10px 0 4px}
 .prog i{position:absolute;left:0;top:0;bottom:0;background:var(--accent);border-radius:2px}
 .prog .pl{position:absolute;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;color:var(--accent)}
@@ -215,7 +220,7 @@ const map = L.map("map", {
 });
 L.control.zoom({ position: "bottomright" }).addTo(map);
 map.attributionControl.setPrefix(false);
-map.attributionControl.addAttribution('Aircraft: <a href="https://opensky-network.org" target="_blank" rel="noopener">OpenSky Network</a>, <a href="https://adsb.lol" target="_blank" rel="noopener">adsb.lol</a>, <a href="https://airplanes.live" target="_blank" rel="noopener">airplanes.live</a> &middot; Routes: <a href="https://github.com/GumDropSoftware/overhead-routes" target="_blank" rel="noopener">overhead-routes</a> (ODbL), <a href="https://www.adsbdb.com" target="_blank" rel="noopener">adsbdb</a> &middot; Airports: <a href="https://ourairports.com" target="_blank" rel="noopener">OurAirports</a>');
+map.attributionControl.addAttribution('Aircraft: <a href="https://opensky-network.org" target="_blank" rel="noopener">OpenSky Network</a>, <a href="https://adsb.lol" target="_blank" rel="noopener">adsb.lol</a>, <a href="https://airplanes.live" target="_blank" rel="noopener">airplanes.live</a>, <a href="https://adsb.fi" target="_blank" rel="noopener">adsb.fi</a> &middot; Routes: <a href="https://github.com/GumDropSoftware/overhead-routes" target="_blank" rel="noopener">overhead-routes</a> (ODbL), <a href="https://www.adsbdb.com" target="_blank" rel="noopener">adsbdb</a> &middot; Airports: <a href="https://ourairports.com" target="_blank" rel="noopener">OurAirports</a>');
 let tiles = null, useCarto = !!CARTO_KEY;
 const OSM_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
 function setTheme(dark) {
@@ -396,7 +401,7 @@ async function loadGlobal() {
 function ingestGlobal(d) {
   gid++;
   for (const a of d.ac) {
-    const [hex, cs, country, lon, lat, altM, gnd, vel, trk, vr, tpos, sq] = a;
+    const [hex, cs, country, lon, lat, altM, gnd, vel, trk, vr, tpos, sq, type, reg] = a;
     let p = planes.get(hex);
     if (!p) { p = { hex }; planes.set(hex, p); }
     p.gid = gid;
@@ -410,6 +415,8 @@ function ingestGlobal(d) {
     p.trk = trk;
     p.vr = vr == null ? null : vr * MS_FPM;
     p.sq = sq || p.sq;
+    if (type) p.type = type;
+    if (reg) p.reg = reg;
     p.t = tpos;
     p.src = "global";
     if (p.hex === ui.selected) pushTrail(p);
@@ -501,13 +508,14 @@ function prune() {
 
 /* ---------- selection, route and info panel ---------- */
 const info = $("#info");
-let routeLayer = null, trailLine = null;
+let routeLayer = null, trailLine = null, remainLine = null;
+const API_TRACK = "/api/track";
 function pushTrail(p) {
   p.trail ||= [];
   const last = p.trail[p.trail.length - 1];
   if (!last || last[0] !== p.lat || last[1] !== p.lon) p.trail.push([p.lat, p.lon]);
   if (p.trail.length > 600) p.trail.shift();
-  if (trailLine) trailLine.setLatLngs(unwrap(p.trail));
+  updateSelectionGraphics(p);
 }
 function unwrap(pts) {
   const out = []; let prev = null;
@@ -518,28 +526,60 @@ function unwrap(pts) {
   }
   return out;
 }
+const shiftNear = (lon, ref) => lon + Math.round((ref - lon) / 360) * 360;
+// Flown track (history from the snapshot job, then live points) and the
+// dashed remaining path from the plane to its destination.
+function updateSelectionGraphics(p) {
+  if (!p || p.hex !== ui.selected) return;
+  const [la, lo] = curPos(p, Date.now() / 1000);
+  const here = [la, shiftNear(lo, map.getCenter().lng)];
+  if (trailLine) {
+    const histEnd = p.hist?.length ? p.hist[p.hist.length - 1][0] : 0;
+    const pts = [...(p.hist || []).map((h) => [h[1], h[2]]), ...(p.trail || []).filter((_, i) => i > 0 || !histEnd), [la, lo]];
+    const u = unwrap(pts), last = u[u.length - 1], k = here[1] - last[1];
+    trailLine.setLatLngs(u.map(([a, b]) => [a, b + k]));
+  }
+  if (remainLine && p.leg) {
+    const gc = greatCircle(here, [p.leg.d.lat, p.leg.d.lon], 64);
+    const k = here[1] - gc[0][1];
+    remainLine.setLatLngs(gc.map(([a, b]) => [a, b + k]));
+  }
+}
+async function loadHistory(p) {
+  try {
+    const r = await fetch(`${API_TRACK}?hex=${p.hex}`);
+    if (!r.ok || !(r.headers.get("content-type") || "").includes("json")) return;
+    const j = await r.json();
+    if (ui.selected !== p.hex) return;
+    p.hist = j.points || [];
+    updateSelectionGraphics(p);
+    if (p.lk) renderInfo(p);
+  } catch {}
+}
 function select(hex, fly) {
   const p = planes.get(hex);
   if (!p) return;
   if (ui.selected && ui.selected !== hex) clearSelectionLayers();
   ui.selected = hex;
   p.trail = [[p.lat, p.lon]];
+  p.hist = null;
   if (!trailLine) trailLine = L.polyline([], { color: ui.dark ? "#6ea0ff" : "#2563eb", weight: 2.5, opacity: 0.9, interactive: false }).addTo(map);
-  trailLine.setLatLngs(p.trail);
+  updateSelectionGraphics(p);
   info.classList.add("open");
   renderInfo(p);
   queueDraw();
   writeHash();
   if (fly) map.flyTo([p.lat, p.lon], Math.max(map.getZoom(), 7), { duration: 0.8 });
+  loadHistory(p);
   fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; renderInfo(p); drawRoute(p); } });
 }
 function clearSelectionLayers() {
-  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; }
   if (trailLine) { map.removeLayer(trailLine); trailLine = null; }
 }
 function deselect() {
   const p = planes.get(ui.selected);
-  if (p) delete p.trail;
+  if (p) { delete p.trail; delete p.hist; }
   ui.selected = null;
   clearSelectionLayers();
   info.classList.remove("open");
@@ -547,6 +587,7 @@ function deselect() {
   queueDraw();
   writeHash();
 }
+map.on("moveend", () => updateSelectionGraphics(planes.get(ui.selected)));
 
 /* ---------- routes ----------
    Primary: overhead-routes, rebuilt nightly from flights adsb.lol actually
@@ -580,10 +621,10 @@ async function observedRoutes(cs) {
         const r = await fetch(`${await routesBase()}/routes/${pre[0]}/${pre}.csv`);
         if (!r.ok) return map;
         for (const line of (await r.text()).split("\n")) {
-          const [c, o, d, days, last] = line.trim().split(",");
+          const [c, o, d, days, last, takeoff] = line.trim().split(",");
           if (!c || !o || !d || c === "callsign") continue;
           if (!map.has(c)) map.set(c, []);
-          map.get(c).push({ o, d, days: +days || 0, last });
+          map.get(c).push({ o, d, days: +days || 0, last, takeoff });
         }
       } catch {}
       return map;
@@ -612,7 +653,7 @@ async function fetchLookup(p) {
   out.cands = [];
   for (const s of seen) {
     const o = apt(s.o), d = apt(s.d);
-    if (o && d) out.cands.push({ o, d, src: "seen", days: s.days });
+    if (o && d) out.cands.push({ o, d, src: "seen", days: s.days, takeoff: s.takeoff });
   }
   if (out.origin && out.dest && !isNaN(out.origin.lat) && !isNaN(out.dest.lat)) out.cands.push({ o: out.origin, d: out.dest, src: "adsbdb", days: 0 });
   lookups.set(key, out);
@@ -666,19 +707,18 @@ function chooseLeg(p) {
 }
 
 function drawRoute(p) {
-  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; }
   const leg = p.leg;
   if (!leg) return;
   const col = ui.dark ? "#6ea0ff" : "#2563eb";
-  const gc = greatCircle([leg.o.lat, leg.o.lon], [leg.d.lat, leg.d.lon]);
-  // Shift the arc into the world copy nearest the plane.
-  const shift = Math.round((p.lon - gc[Math.floor(gc.length / 2)][1]) / 360) * 360;
-  const arc = gc.map(([a, b]) => [a, b + shift]);
+  const ref = shiftNear(p.lon, map.getCenter().lng);
+  remainLine = L.polyline([], { color: col, weight: 1.6, opacity: 0.75, dashArray: "5 6", interactive: false });
   routeLayer = L.layerGroup([
-    L.polyline(arc, { color: col, weight: 1.6, opacity: 0.7, dashArray: "5 6", interactive: false }),
-    L.circleMarker(arc[0], { radius: 4, color: col, weight: 2, fillColor: "#fff", fillOpacity: 1, interactive: false }),
-    L.circleMarker(arc[arc.length - 1], { radius: 4, color: col, weight: 2, fillColor: col, fillOpacity: 1, interactive: false }),
+    remainLine,
+    L.circleMarker([leg.o.lat, shiftNear(leg.o.lon, ref)], { radius: 4, color: col, weight: 2, fillColor: "#fff", fillOpacity: 1, interactive: false }),
+    L.circleMarker([leg.d.lat, shiftNear(leg.d.lon, ref)], { radius: 4, color: col, weight: 2, fillColor: col, fillOpacity: 1, interactive: false }),
   ]).addTo(map);
+  updateSelectionGraphics(p);
 }
 
 function routeProgress(p, leg) {
@@ -687,6 +727,42 @@ function routeProgress(p, leg) {
 }
 function apLabel(a) { return a ? esc(a.iata || a.icao || "?") : "?"; }
 function apCity(a) { return a ? esc([a.city || a.name, a.country].filter(Boolean).join(", ")) : ""; }
+const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+function fmtDur(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+// Typical departure (median takeoff over the last week), actual takeoff (first
+// airborne point near the origin in the track history), and estimated arrival
+// (distance left at current ground speed). All shown in the viewer's time zone.
+function legTimes(p, leg) {
+  const out = {};
+  if (/^\d{1,2}:\d{2}$/.test(leg.takeoff || "")) {
+    const [h, m] = leg.takeoff.split(":").map(Number);
+    const d = new Date(); d.setUTCHours(h, m, 0, 0);
+    let t = d.getTime();
+    while (t > Date.now() + 6 * 3600e3) t -= 86400e3;
+    while (t < Date.now() - 18 * 3600e3) t += 86400e3;
+    out.typical = t;
+  }
+  const f = p.hist?.[0];
+  if (f && distNm(f[1], f[2], leg.o.lat, leg.o.lon) < 60 && Date.now() / 1000 - f[0] < 3.8 * 3600) out.tookOff = f[0] * 1000;
+  if (!p.gnd && p.gs > 100) {
+    const [la, lo] = curPos(p, Date.now() / 1000);
+    out.eta = Date.now() + (distNm(la, lo, leg.d.lat, leg.d.lon) / p.gs) * 3600e3;
+  }
+  return out;
+}
+function depHtml(t) {
+  const rows = [];
+  if (t.typical) rows.push(`Usually departs <b>${fmtTime(t.typical)}</b>`);
+  if (t.tookOff) rows.push(`Took off <b>${fmtTime(t.tookOff)}</b>`);
+  return rows.join("<br>");
+}
+function arrHtml(p, t) {
+  if (p.gnd) return "On the ground";
+  return t.eta ? `Est. arrival <b>${fmtTime(t.eta)}</b><br>in ${fmtDur(t.eta - Date.now())}` : "";
+}
 function legSource(leg) {
   if (leg.src === "adsbdb") return "From the adsbdb callsign database, not confirmed by recent flights.";
   const caution = routesCaution === "schedule-change" ? " Airline schedules changed this week, so treat it with some caution." : "";
@@ -702,14 +778,14 @@ function renderInfo(p) {
   let route = "";
   if (lk === undefined) route = `<div class="route skel">Looking up route</div>`;
   else if (p.leg) {
-    const leg = p.leg, rc = routeProgress(p, leg);
+    const leg = p.leg, rc = routeProgress(p, leg), tm = legTimes(p, leg);
     route = `<div class="route">
-      <div class="ap"><div><div class="code">${apLabel(leg.o)}</div><div class="city" title="${esc(leg.o.name)}">${apCity(leg.o)}</div></div>
-      <div class="r"><div class="code">${apLabel(leg.d)}</div><div class="city" title="${esc(leg.d.name)}">${apCity(leg.d)}</div></div></div>
+      <div class="ap"><div><div class="code">${apLabel(leg.o)}</div><div class="city" title="${esc(leg.o.name)}">${apCity(leg.o)}</div><div class="tm" id="tdep">${depHtml(tm)}</div></div>
+      <div class="r"><div class="code">${apLabel(leg.d)}</div><div class="city" title="${esc(leg.d.name)}">${apCity(leg.d)}</div><div class="tm" id="tarr">${arrHtml(p, tm)}</div></div></div>
       <div class="prog" id="prog"><i style="width:${(rc.frac * 100).toFixed(1)}%"></i>
         <svg class="pl" style="left:${(rc.frac * 100).toFixed(1)}%" viewBox="-10 -10 20 20"><path transform="rotate(90)" fill="currentColor" d="${plane}"/></svg></div>
       <div class="note" id="rnote">${nf(rc.done)} nm flown, ${nf(rc.left)} nm to go</div>
-      <div class="note">${legSource(leg)}</div>
+      <div class="note">${legSource(leg)} Times are in your time zone.</div>
     </div>`;
   } else if (lk.cands.length) {
     const c = lk.cands[0];
@@ -760,7 +836,10 @@ function renderStats() {
     const rc = routeProgress(p, p.leg), n = $("#rnote"), bar = $("#prog");
     if (n) n.textContent = `${nf(rc.done)} nm flown, ${nf(rc.left)} nm to go`;
     if (bar) { bar.querySelector("i").style.width = (rc.frac * 100).toFixed(1) + "%"; bar.querySelector(".pl").style.left = (rc.frac * 100).toFixed(1) + "%"; }
+    const ta = $("#tarr");
+    if (ta) ta.innerHTML = arrHtml(p, legTimes(p, p.leg));
   }
+  updateSelectionGraphics(p);
 }
 
 /* ---------- status ---------- */
