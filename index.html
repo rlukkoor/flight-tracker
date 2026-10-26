@@ -36,6 +36,9 @@ h1 .live.off{background:var(--muted);animation:none}
 .search{margin-top:10px;position:relative}
 .search input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:9px;background:var(--chip);color:var(--text);font:inherit;outline:none}
 .search input:focus{border-color:var(--accent)}
+.qmsg{font-size:12px;color:var(--muted);margin-top:6px}
+.qmsg:empty{display:none}
+.qmsg a{color:var(--accent)}
 .row{display:flex;gap:6px;margin-top:9px;flex-wrap:wrap}
 .tog{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:var(--chip);border:1px solid var(--line);
   cursor:pointer;user-select:none;font-size:12.5px;color:var(--text)}
@@ -102,7 +105,7 @@ button.tog{font:inherit;font-size:12.5px}
   <button id="collapse" aria-label="Collapse panel">&#9662;</button>
   <div id="count">Loading aircraft</div>
   <div class="body">
-    <div class="search"><input id="q" type="search" placeholder="Callsign, airline code, hex or tail number" autocomplete="off" spellcheck="false"></div>
+    <div class="search"><input id="q" type="search" placeholder="Flight (UA189), callsign, hex or tail" autocomplete="off" spellcheck="false"><div id="qmsg" class="qmsg"></div></div>
     <div class="row">
       <label class="tog"><input type="checkbox" id="fAir" checked> Airlines only</label>
       <label class="tog"><input type="checkbox" id="fGnd" checked> On ground</label>
@@ -261,11 +264,18 @@ let dpr = 1, cw = 0, ch = 0, zooming = false, lastDraw = 0, drawQueued = false;
 
 function curPos(p, nowS) {
   if (p.gnd || !(p.gs > 40) || p.trk == null || !p.t) return [p.lat, p.lon];
-  const dt = Math.min(Math.max(nowS - p.t, 0), MAX_EXTRAP);
+  const dt = Math.min(Math.max(nowS - p.t, 0), p.est ? EST_MAX_S : MAX_EXTRAP);
   return dt > 0.5 ? project(p.lat, p.lon, p.trk, (p.gs * dt) / 3600) : [p.lat, p.lon];
+}
+// "UA189" means callsign "UAL189": convert IATA flight numbers to ICAO callsigns.
+function toCallsign(q) {
+  const m = /^([A-Z0-9]{2})0*(\d{1,4}[A-Z]?)$/.exec(q);
+  const icao = m && airlinesByIata?.[m[1]];
+  return icao && !/^[A-Z]{3}\d/.test(q) ? icao + m[2] : null;
 }
 function matchesQuery(p) {
   const q = ui.q;
+  if (ui.qAlt && p.cs && p.cs.startsWith(ui.qAlt)) return true;
   return (p.cs && p.cs.startsWith(q)) || p.hex.startsWith(q.toLowerCase()) || (p.reg && p.reg.replace(/-/g, "").startsWith(q.replace(/-/g, "")));
 }
 function passes(p) {
@@ -311,10 +321,12 @@ function draw() {
     const a = rad(p.trk || 0), c = Math.cos(a) * s, sn = Math.sin(a) * s;
     ctx.setTransform(c, sn, -sn, c, x * dpr, y * dpr);
     ctx.fillStyle = altColor(p);
+    ctx.globalAlpha = p.est ? 0.35 : 1;
     ctx.fill(PLANE);
     if (z >= 4) ctx.stroke(PLANE);
     hitX[hitN] = x; hitY[hitN] = y; hitP[hitN++] = p;
   }
+  ctx.globalAlpha = 1;
   if (sel) {
     const { p, x, y } = sel;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -505,12 +517,17 @@ function ingestLive(d) {
   queueDraw();
   if (ui.selected) renderStats();
 }
+// Planes missing from the latest data are dropped, except cruising ones, which
+// usually just flew out of receiver range (over water, say). Those stay for up
+// to 30 minutes as estimated positions, moving along their last heading.
+const EST_MAX_S = 1800;
 function prune() {
   const now = Date.now();
   for (const [hex, p] of planes) {
-    if (hex === ui.selected) continue;
-    if (p.gid === gid && gid > 0) continue;
-    if (p.liveSeen && now - p.liveSeen < 90000) continue;
+    if ((p.gid === gid && gid > 0) || (p.liveSeen && now - p.liveSeen < 90000)) { p.est = false; continue; }
+    const cruising = !p.gnd && p.gs > 150 && p.alt > 15000 && p.trk != null;
+    if (cruising && now / 1000 - p.t < EST_MAX_S) { p.est = true; continue; }
+    if (hex === ui.selected) { p.est = true; continue; }
     planes.delete(hex);
   }
 }
@@ -619,12 +636,18 @@ map.on("moveend", () => updateSelectionGraphics(planes.get(ui.selected)));
 const ROUTES_CDN = "https://cdn.jsdelivr.net/gh/GumDropSoftware/overhead-routes";
 let airportsP = null, routesBaseP = null, routesCaution = null;
 const airlineRoutes = new Map();
-let airlinesP = null;
+let airlinesP = null, airportsData = null, airlinesByIata = null;
 function loadAirlines() {
-  return (airlinesP ||= fetch("airlines.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
+  return (airlinesP ||= fetch("airlines.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})).then((d) => {
+    airlinesByIata = {};
+    for (const [icao, [iata]] of Object.entries(d)) if (iata && !airlinesByIata[iata]) airlinesByIata[iata] = icao;
+    // The main carrier wins where codes were reused.
+    Object.assign(airlinesByIata, { UA: "UAL", DL: "DAL", AA: "AAL", WN: "SWA", AS: "ASA", B6: "JBU", BA: "BAW", LH: "DLH", AF: "AFR", EK: "UAE", QR: "QTR" });
+    return d;
+  }));
 }
 function loadAirports() {
-  return (airportsP ||= fetch("airports.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
+  return (airportsP ||= fetch("airports.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})).then((d) => (airportsData = d)));
 }
 function routesBase() {
   return (routesBaseP ||= fetch(`${ROUTES_CDN}@main/latest.json`, { cache: "no-store" })
@@ -847,6 +870,19 @@ function legSource(leg) {
   return `Flown on this route ${leg.days} of the last 7 days.${caution}`;
 }
 
+// Where did tracking begin? If the first recorded point is near an airport,
+// that's very likely where this flight took off.
+function inferOrigin(p) {
+  const f = p.hist?.[0];
+  if (!f || !airportsData) return null;
+  let best = null, bd = 30;
+  for (const [icao, a] of Object.entries(airportsData)) {
+    if (Math.abs(a[4] - f[1]) > 1 || Math.abs(a[5] - f[2]) > 1.5 / Math.max(0.2, Math.cos(rad(f[1])))) continue;
+    const d = distNm(f[1], f[2], a[4], a[5]) - (a[0] ? 5 : 0); // prefer airports with airline service codes
+    if (d < bd) { bd = d; best = { icao, iata: a[0], name: a[1], city: a[2], country: a[3], lat: a[4], lon: a[5] }; }
+  }
+  return best;
+}
 function renderInfo(p) {
   const lk = p.lk;
   if (lk) p.leg = chooseLeg(p);
@@ -867,10 +903,18 @@ function renderInfo(p) {
       <div class="note" id="rnote">${nf(rc.done)} nm flown, ${nf(rc.left)} nm to go</div>
       <div class="note">${legSource(leg)}${leg.src === "fa" ? "" : " Times are in your time zone."}${lk.faStatus === "limited" ? " FlightAware's daily lookup limit was reached, so these are estimates." : ""}</div>
     </div>`;
-  } else if (lk.cands.length) {
-    const c = lk.cands[0];
-    route = `<div class="route"><div class="note warn">Route unconfirmed. This callsign is listed as ${apLabel(c.o)} to ${apLabel(c.d)}, but that doesn't match where the plane is or where it's heading.</div></div>`;
-  } else route = `<div class="route note">No route on file for this callsign.</div>`;
+  } else {
+    const c = lk.cands[0], io = inferOrigin(p);
+    const why = c
+      ? `This callsign usually flies ${apLabel(c.o)} to ${apLabel(c.d)}, but that doesn't fit where the plane is or where it's heading, so it's likely on a different route today.`
+      : "No route on file for this callsign.";
+    route = io
+      ? `<div class="route">
+          <div class="ap"><div><div class="code">${apLabel(io)}</div><div class="city" title="${esc(io.name)}">${apCity(io)}</div><div class="tm">Took off <b>${fmtTime(p.hist[0][0] * 1000)}</b></div></div>
+          <div class="r"><div class="code">?</div><div class="city">Destination unknown</div></div></div>
+          <div class="note">Origin is where tracking began. ${why}</div></div>`
+      : `<div class="route"><div class="note${c ? " warn" : ""}">${why}</div></div>`;
+  }
 
   info.innerHTML = `
     <div class="ihead">
@@ -906,7 +950,8 @@ function renderStats() {
   el.innerHTML = cells.map(([k, v]) => `<div><div class="k">${k}</div><div class="v" title="${String(v).replace(/<[^>]+>|&[a-z#0-9]+;/g, "")}">${v}</div></div>`).join("");
   const age = p.t ? Date.now() / 1000 - p.t : null;
   const owner = ac?.owner ? `Operated by ${esc(ac.owner)}. ` : "";
-  $("#foot").innerHTML = `${owner}${p.country ? "Registered in " + esc(p.country) + ". " : ""}Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.
+  const estNote = p.est ? `<span class="late">Estimated position. No receiver has picked this plane up for ${fmtDur(Date.now() - p.t * 1000)}, usually because it's out of range over water or remote land.</span><br>` : "";
+  $("#foot").innerHTML = `${estNote}${owner}${p.country ? "Registered in " + esc(p.country) + ". " : ""}Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.
     ${p.cs ? `<br><a href="https://www.flightaware.com/live/flight/${encodeURIComponent(p.cs)}" target="_blank" rel="noopener">FlightAware</a> &middot; ` : "<br>"}<a href="https://globe.adsb.lol/?icao=${p.hex}" target="_blank" rel="noopener">adsb.lol globe</a>`;
   if (p.lk) {
     // Re-check the leg as the plane moves; redraw only if the answer changes.
@@ -948,17 +993,25 @@ setInterval(() => { updateStatus(); if (ui.selected) renderStats(); }, 1000);
 
 /* ---------- search and filters ---------- */
 const q = $("#q");
-q.addEventListener("input", () => { ui.q = q.value.trim().toUpperCase(); queueDraw(); });
+q.addEventListener("input", () => {
+  ui.q = q.value.trim().toUpperCase().replace(/\s+/g, "");
+  ui.qAlt = toCallsign(ui.q);
+  $("#qmsg").innerHTML = "";
+  queueDraw();
+});
+loadAirlines();
 q.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { q.value = ""; ui.q = ""; queueDraw(); q.blur(); return; }
   if (e.key !== "Enter" || !ui.q) return;
-  const Q = ui.q, Ql = Q.toLowerCase();
+  const Q = ui.q, Ql = Q.toLowerCase(), alt = ui.qAlt;
   let best = null;
   for (const p of planes.values()) {
-    if (p.cs === Q || p.hex === Ql || (p.reg && p.reg.replace(/-/g, "") === Q.replace(/-/g, ""))) { best = p; break; }
+    if (p.cs === Q || (alt && p.cs === alt) || p.hex === Ql || (p.reg && p.reg.replace(/-/g, "") === Q.replace(/-/g, ""))) { best = p; break; }
     if (!best && matchesQuery(p)) best = p;
   }
-  if (best) { select(best.hex, true); q.blur(); }
+  if (best) { select(best.hex, true); q.blur(); return; }
+  const id = alt || Q;
+  $("#qmsg").innerHTML = `${esc(id)} isn't on the map right now. It may not have taken off yet, may have landed, or may be out of receiver range for over 30 minutes. <a href="https://www.flightaware.com/live/flight/${encodeURIComponent(id)}" target="_blank" rel="noopener">Check FlightAware</a>`;
 });
 $("#fAir").addEventListener("change", (e) => { ui.airlinesOnly = e.target.checked; queueDraw(); });
 $("#fGnd").addEventListener("change", (e) => { ui.showGround = e.target.checked; queueDraw(); });
