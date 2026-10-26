@@ -560,7 +560,7 @@ function prune() {
     const cruising = !p.gnd && p.gs > 150 && p.alt > 15000 && p.trk != null;
     if (cruising && now / 1000 - p.t < EST_MAX_S) { p.est = true; continue; }
     // Out of range for over 30 minutes: if FlightAware gave us its schedule, follow that instead.
-    if (!p.gnd && tryFaPath(p)) { p.est = true; continue; }
+    if (!p.gnd && tryFaPath(p)) { p.est = true; if (hex === ui.selected) loadFaTrack(p); continue; }
     if (hex === ui.selected) { p.est = true; continue; }
     planes.delete(hex);
   }
@@ -630,6 +630,43 @@ function tryFaPath(p) {
   // Continue from where a receiver last saw it, toward the destination, arriving on FlightAware's estimate.
   setFaPath(p, { lat: p.lat, lon: p.lon }, leg.d, Math.max(t.off, (p.t || 0) * 1000), t.on);
   return true;
+}
+// FlightAware's recorded track for an out-of-range flight: real positions,
+// including satellite ones over oceans. Fetched only for planes whose current
+// position is estimated, since it costs more than a lookup.
+const faTrackMemo = new Map();
+async function loadFaTrack(p) {
+  const id = p.lk?.fa?.faId;
+  if (!id || !(p.synthetic || p.faPath)) return;
+  let m = faTrackMemo.get(id);
+  if (!m || Date.now() - m.at > 600e3) {
+    m = { at: Date.now(), p: fetch(`${API_FLIGHT}?track=${encodeURIComponent(id)}`)
+      .then((r) => ((r.headers.get("content-type") || "").includes("json") ? r.json() : null)).catch(() => null) };
+    faTrackMemo.set(id, m);
+  }
+  const j = await m.p;
+  if (ui.selected !== p.hex) return;
+  if (!j?.points?.length) { if (j?.limited) { p.faTrackLimited = j.limited; renderStats(); } return; }
+  p.hist = mergeTracks(p.hist, j.points.map((q) => [q[0], q[1], q[2]]));
+  const last = j.points[j.points.length - 1];
+  p.seenAt = last[0]; p.seenSrc = last[6];
+  if (p.synthetic) { if (last[3]) p.altSeen = last[3]; if (last[4]) p.gsSeen = last[4]; }
+  rebuildEstimate(p);
+  updateSelectionGraphics(p);
+  renderInfo(p);
+}
+// Combine position lists from different sources, in time order, without near-duplicates.
+function mergeTracks(a, b) {
+  const all = [...(a || []), ...(b || [])].sort((x, y) => x[0] - y[0]);
+  const out = [];
+  for (const q of all) { const l = out[out.length - 1]; if (!l || q[0] - l[0] > 20) out.push(q); }
+  return out;
+}
+// Restart the estimate from the newest real position.
+function rebuildEstimate(p) {
+  const t = faTimes(p.lk?.fa), leg = p.leg, last = p.hist?.[p.hist.length - 1];
+  if (!p.faPath || !t || !leg || !last) return;
+  if (last[0] * 1000 >= t.off - 600e3 && last[0] * 1000 < t.on) setFaPath(p, { lat: last[1], lon: last[2] }, leg.d, last[0] * 1000, t.on);
 }
 // For a stand-in: start the estimate from the last recorded position, if the
 // snapshot job saw this aircraft earlier in the flight.
@@ -745,7 +782,8 @@ async function loadHistory(p) {
     if (!r.ok || !(r.headers.get("content-type") || "").includes("json")) return;
     const j = await r.json();
     if (ui.selected !== p.hex) return;
-    p.hist = j.points || [];
+    p.hist = mergeTracks(p.hist, j.points || []);
+    rebuildEstimate(p);
     updateSelectionGraphics(p);
     if (p.lk) renderInfo(p);
   } catch {}
@@ -765,7 +803,7 @@ function select(hex, fly) {
   writeHash();
   if (fly) map.flyTo([p.lat, p.lon], Math.max(map.getZoom(), 7), { duration: 0.8 });
   loadHistory(p);
-  fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; renderInfo(p); drawRoute(p); } });
+  fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; renderInfo(p); drawRoute(p); loadFaTrack(p); } });
 }
 function clearSelectionLayers() {
   if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; estLine = null; }
@@ -1107,8 +1145,8 @@ function renderStats() {
   const type = ac ? [ac.maker, ac.type].filter(Boolean).join(" ") : (p.desc || p.type || "");
   const vr = p.synthetic ? "Not reported" : p.vr == null ? "n/a" : Math.abs(p.vr) < 100 ? "Level" : (p.vr > 0 ? "&#9650; " : "&#9660; ") + nf(Math.abs(p.vr)) + " fpm";
   const cells = [
-    ["Altitude", p.gnd ? "On ground" : p.synthetic ? (p.altFiled ? nf(p.altFiled) + " ft (filed)" : "Out of range") : p.alt != null ? nf(p.alt) + " ft" : "n/a"],
-    [p.synthetic ? "Speed" : "Ground speed", p.synthetic ? (p.spdFiled ? nf(p.spdFiled) + " kt (filed)" : p.gs ? "~" + nf(p.gs) + " kt avg." : "n/a") : p.gs != null ? nf(p.gs) + " kt" : "n/a"],
+    ["Altitude", p.gnd ? "On ground" : p.synthetic ? (p.altSeen ? nf(p.altSeen) + " ft" : p.altFiled ? nf(p.altFiled) + " ft (filed)" : "Out of range") : p.alt != null ? nf(p.alt) + " ft" : "n/a"],
+    [p.synthetic && !p.gsSeen ? "Speed" : "Ground speed", p.synthetic ? (p.gsSeen ? nf(p.gsSeen) + " kt" : p.spdFiled ? nf(p.spdFiled) + " kt (filed)" : p.gs ? "~" + nf(p.gs) + " kt avg." : "n/a") : p.gs != null ? nf(p.gs) + " kt" : "n/a"],
     ["Heading", p.trk != null ? Math.round(p.trk) + "&deg;" : "n/a"],
     ["Vertical", vr],
     ["Aircraft", esc(type || "Unknown")],
@@ -1120,7 +1158,7 @@ function renderStats() {
   const age = p.t ? Date.now() / 1000 - p.t : null;
   const owner = ac?.owner ? `Operated by ${esc(ac.owner)}. ` : "";
   const estNote = p.faPath
-    ? `<span class="late">Estimated position. No receiver is in range, which is normal over open ocean, so the plane is placed along the shortest route from ${p.hist?.length || !p.synthetic ? "where it was last seen" : "its origin"}, timed to FlightAware's arrival estimate. The solid line is where receivers actually tracked it; the dotted line is estimated and can be off by a few hundred miles.</span><br>`
+    ? `<span class="late">Estimated position. ${p.seenAt ? `FlightAware's last position report was ${fmtDur(Date.now() - p.seenAt * 1000)} ago${p.seenSrc === "S" ? ", from a satellite receiver" : ""}.` : "No receiver is in range, which is normal over open ocean."} From there the plane is placed along the shortest route to ${esc(p.leg?.d?.iata || "its destination")}, timed to FlightAware's arrival estimate. The solid line is its real recorded path; the dotted line is estimated.${p.faTrackLimited ? ` FlightAware's ${p.faTrackLimited === "month" ? "monthly" : "daily"} limit was reached, so its recorded track couldn't be loaded.` : ""}</span><br>`
     : p.est ? `<span class="late">Estimated position. No receiver has picked this plane up for ${fmtDur(Date.now() - p.t * 1000)}, usually because it's out of range over water or remote land.</span><br>` : "";
   const from = p.faPath ? "" : `Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.`;
   const links = [

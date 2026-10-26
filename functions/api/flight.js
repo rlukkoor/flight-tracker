@@ -39,10 +39,71 @@ function pick(flights) {
   return best;
 }
 
+// Usage limits. Months and days are counted in UTC, the same way AeroAPI bills.
+// A flight lookup counts as 1 unit. A track counts as AEROAPI_TRACK_UNITS
+// (default 3), on the cautious side; check AeroAPI's per-query price table and
+// adjust if tracks cost less.
+async function reserve(context, units) {
+  const { env } = context;
+  const monthly = Number(env.AEROAPI_MONTHLY_LIMIT) || 900;
+  const daily = Number(env.AEROAPI_DAILY_LIMIT) || 30;
+  const today = new Date().toISOString().slice(0, 10), month = today.slice(0, 7);
+  let u = {};
+  try { u = JSON.parse((await env.FLIGHTS_KV.get("aero-usage")) || "{}"); } catch {}
+  if (u.month !== month) u = { month, m: 0, day: today, d: 0 };
+  if (u.day !== today) { u.day = today; u.d = 0; }
+  if (u.m + units > monthly) return { limited: "month" };
+  if (u.d + units > daily) return { limited: "day" };
+  return {
+    commit() {
+      u.m += units; u.d += units;
+      context.waitUntil(env.FLIGHTS_KV.put("aero-usage", JSON.stringify(u)));
+    },
+  };
+}
+
+// GET /api/flight?track=<fa_flight_id>: FlightAware's recorded positions for one
+// flight, including satellite (space-based ADS-B) positions over oceans.
+async function track(context, faId) {
+  const { request, env } = context;
+  let cache = null, key = null;
+  try {
+    cache = caches.default;
+    key = new Request(new URL(`/__cache/fatrack?id=${encodeURIComponent(faId)}`, request.url).toString());
+    const hit = await cache.match(key);
+    if (hit) return hit;
+  } catch {}
+  const res0 = await reserve(context, Number(env.AEROAPI_TRACK_UNITS) || 3);
+  if (res0.limited) return json({ enabled: true, limited: res0.limited });
+  let r;
+  try {
+    r = await fetch(`${BASE}/flights/${encodeURIComponent(faId)}/track`, {
+      headers: { "x-apikey": env.AEROAPI_KEY, accept: "application/json" },
+    });
+  } catch (e) {
+    return json({ enabled: true, error: `FlightAware unreachable (${e.message})` });
+  }
+  res0.commit();
+  if (!r.ok) return json({ enabled: true, error: `FlightAware returned ${r.status}` });
+  const d = await r.json();
+  // [epochSeconds, lat, lon, altitudeFt, groundspeedKt, heading, source]
+  const points = (d.positions || [])
+    .filter((p) => p.latitude != null && p.longitude != null && p.update_type !== "P")
+    .map((p) => [Math.round(Date.parse(p.timestamp) / 1000), p.latitude, p.longitude,
+      p.altitude != null ? p.altitude * 100 : null, p.groundspeed ?? null, p.heading ?? null, p.update_type || null]);
+  const res = json({ enabled: true, points }, 600);
+  if (cache) context.waitUntil(cache.put(key, res.clone()).catch(() => {}));
+  return res;
+}
+
 export async function onRequestGet(context) {
   const { request, env } = context;
   if (!env.AEROAPI_KEY) return json({ enabled: false });
-  const cs = (new URL(request.url).searchParams.get("cs") || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
+  if (!env.FLIGHTS_KV) return json({ enabled: true, error: "FLIGHTS_KV binding missing, so usage can't be capped" });
+  const params = new URL(request.url).searchParams;
+  const faId = (params.get("track") || "").replace(/[^A-Za-z0-9-]/g, "").slice(0, 80);
+  if (faId) return track(context, faId);
+  const cs = (params.get("cs") || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
   if (cs.length < 3) return json({ enabled: true, error: "callsign required" });
 
   let cache = null, key = null;
@@ -53,17 +114,8 @@ export async function onRequestGet(context) {
     if (hit) return hit;
   } catch {}
 
-  // Usage limits. Months and days are counted in UTC, the same way AeroAPI bills.
-  if (!env.FLIGHTS_KV) return json({ enabled: true, error: "FLIGHTS_KV binding missing, so usage can't be capped" });
-  const monthly = Number(env.AEROAPI_MONTHLY_LIMIT) || 900;
-  const daily = Number(env.AEROAPI_DAILY_LIMIT) || 30;
-  const today = new Date().toISOString().slice(0, 10), month = today.slice(0, 7);
-  let u = {};
-  try { u = JSON.parse((await env.FLIGHTS_KV.get("aero-usage")) || "{}"); } catch {}
-  if (u.month !== month) u = { month, m: 0, day: today, d: 0 };
-  if (u.day !== today) { u.day = today; u.d = 0; }
-  if (u.m >= monthly) return json({ enabled: true, limited: "month" });
-  if (u.d >= daily) return json({ enabled: true, limited: "day" });
+  const slot = await reserve(context, 1);
+  if (slot.limited) return json({ enabled: true, limited: slot.limited });
 
   let r;
   try {
@@ -73,13 +125,12 @@ export async function onRequestGet(context) {
   } catch (e) {
     return json({ enabled: true, error: `FlightAware unreachable (${e.message})` });
   }
-  u.m++; u.d++;
-  context.waitUntil(env.FLIGHTS_KV.put("aero-usage", JSON.stringify(u)));
+  slot.commit();
   if (!r.ok) return json({ enabled: true, error: `FlightAware returned ${r.status}` });
 
   const f = pick((await r.json()).flights || []);
   const flight = f && {
-    ident: f.ident, identIata: f.ident_iata, operatorIata: f.operator_iata, status: f.status,
+    faId: f.fa_flight_id || null, ident: f.ident, identIata: f.ident_iata, operatorIata: f.operator_iata, status: f.status,
     origin: apt(f.origin), destination: apt(f.destination),
     gateOrigin: f.gate_origin, gateDest: f.gate_destination, termOrigin: f.terminal_origin, termDest: f.terminal_destination,
     out: { sched: f.scheduled_out, est: f.estimated_out, act: f.actual_out },
