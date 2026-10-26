@@ -215,7 +215,7 @@ const map = L.map("map", {
 });
 L.control.zoom({ position: "bottomright" }).addTo(map);
 map.attributionControl.setPrefix(false);
-map.attributionControl.addAttribution('Aircraft: <a href="https://opensky-network.org" target="_blank" rel="noopener">OpenSky Network</a>, <a href="https://adsb.lol" target="_blank" rel="noopener">adsb.lol</a>, <a href="https://airplanes.live" target="_blank" rel="noopener">airplanes.live</a> &middot; Routes: <a href="https://www.adsbdb.com" target="_blank" rel="noopener">adsbdb</a>');
+map.attributionControl.addAttribution('Aircraft: <a href="https://opensky-network.org" target="_blank" rel="noopener">OpenSky Network</a>, <a href="https://adsb.lol" target="_blank" rel="noopener">adsb.lol</a>, <a href="https://airplanes.live" target="_blank" rel="noopener">airplanes.live</a> &middot; Routes: <a href="https://github.com/GumDropSoftware/overhead-routes" target="_blank" rel="noopener">overhead-routes</a> (ODbL), <a href="https://www.adsbdb.com" target="_blank" rel="noopener">adsbdb</a> &middot; Airports: <a href="https://ourairports.com" target="_blank" rel="noopener">OurAirports</a>');
 let tiles = null, useCarto = !!CARTO_KEY;
 const OSM_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
 function setTheme(dark) {
@@ -548,22 +548,73 @@ function deselect() {
   writeHash();
 }
 
+/* ---------- routes ----------
+   Primary: overhead-routes, rebuilt nightly from flights adsb.lol actually
+   observed (origin and destination per callsign, last 7 days).
+   Fallback: adsbdb, which keeps one route per callsign and is often stale.
+   Every candidate is checked against the plane's position and heading, and
+   only a leg that fits is drawn. */
+const ROUTES_CDN = "https://cdn.jsdelivr.net/gh/GumDropSoftware/overhead-routes";
+let airportsP = null, routesBaseP = null, routesCaution = null;
+const airlineRoutes = new Map();
+function loadAirports() {
+  return (airportsP ||= fetch("airports.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
+}
+function routesBase() {
+  return (routesBaseP ||= fetch(`${ROUTES_CDN}@main/latest.json`, { cache: "no-store" })
+    .then((r) => r.json())
+    .then((j) => { routesCaution = j.caution || null; return j.commit ? `${ROUTES_CDN}@${j.commit}` : `${ROUTES_CDN}@main`; })
+    .catch(() => `${ROUTES_CDN}@main`));
+}
+function normCs(cs) {
+  const m = /^([A-Z]{3})0*(\d+)([A-Z]*)$/.exec(cs || "");
+  return m ? m[1] + m[2] + m[3] : cs;
+}
+async function observedRoutes(cs) {
+  const pre = (cs || "").slice(0, 3);
+  if (!/^[A-Z]{3}$/.test(pre)) return [];
+  if (!airlineRoutes.has(pre)) {
+    airlineRoutes.set(pre, (async () => {
+      const map = new Map();
+      try {
+        const r = await fetch(`${await routesBase()}/routes/${pre[0]}/${pre}.csv`);
+        if (!r.ok) return map;
+        for (const line of (await r.text()).split("\n")) {
+          const [c, o, d, days, last] = line.trim().split(",");
+          if (!c || !o || !d || c === "callsign") continue;
+          if (!map.has(c)) map.set(c, []);
+          map.get(c).push({ o, d, days: +days || 0, last });
+        }
+      } catch {}
+      return map;
+    })());
+  }
+  return (await airlineRoutes.get(pre)).get(normCs(cs)) || [];
+}
+
 async function fetchLookup(p) {
   const cs = isLikelyCallsign(p.cs) ? p.cs : "";
   const key = cs + "|" + p.hex;
   if (lookups.has(key)) return lookups.get(key);
-  let raw = null;
-  try {
-    const r = await fetch(`${API_LOOKUP}?cs=${encodeURIComponent(cs)}&hex=${p.hex}`);
-    if (r.ok && (r.headers.get("content-type") || "").includes("json")) raw = await r.json();
-  } catch {}
-  if (!raw) {
+  const adsbdb = (async () => {
+    try {
+      const r = await fetch(`${API_LOOKUP}?cs=${encodeURIComponent(cs)}&hex=${p.hex}`);
+      if (r.ok && (r.headers.get("content-type") || "").includes("json")) return await r.json();
+    } catch {}
     // No proxy (for example opened locally): try adsbdb directly.
     const g = async (path) => { try { return await (await fetch(ADSBDB + path)).json(); } catch { return null; } };
     const [route, aircraft] = await Promise.all([cs ? g("callsign/" + cs) : null, g("aircraft/" + p.hex)]);
-    raw = { route, aircraft };
-  }
+    return { route, aircraft };
+  })();
+  const [raw, seen, apts] = await Promise.all([adsbdb, cs && isAirline(cs) ? observedRoutes(cs) : [], loadAirports()]);
   const out = normalize(raw);
+  const apt = (icao) => { const a = apts[icao]; return a && { icao, iata: a[0], name: a[1], city: a[2], country: a[3], lat: a[4], lon: a[5] }; };
+  out.cands = [];
+  for (const s of seen) {
+    const o = apt(s.o), d = apt(s.d);
+    if (o && d) out.cands.push({ o, d, src: "seen", days: s.days });
+  }
+  if (out.origin && out.dest && !isNaN(out.origin.lat) && !isNaN(out.dest.lat)) out.cands.push({ o: out.origin, d: out.dest, src: "adsbdb", days: 0 });
   lookups.set(key, out);
   return out;
 }
@@ -578,12 +629,48 @@ function normalize(raw) {
     aircraft: ac ? { type: ac.type, icaoType: ac.icao_type, maker: ac.manufacturer, reg: ac.registration, owner: ac.registered_owner, ownerCountry: ac.registered_owner_country_name, photo: ac.url_photo, thumb: ac.url_photo_thumbnail } : null,
   };
 }
+
+function bearing(la1, lo1, la2, lo2) {
+  const y = Math.sin(rad(lo2 - lo1)) * Math.cos(rad(la2));
+  const x = Math.cos(rad(la1)) * Math.sin(rad(la2)) - Math.sin(rad(la1)) * Math.cos(rad(la2)) * Math.cos(rad(lo2 - lo1));
+  return (deg(Math.atan2(y, x)) + 360) % 360;
+}
+// Does the plane plausibly sit on the leg o -> d? Returns its cross track distance, or null.
+function legFit(p, o, d) {
+  const len = distNm(o.lat, o.lon, d.lat, d.lon);
+  if (len < 5) return null;
+  const fromO = distNm(o.lat, o.lon, p.lat, p.lon), toD = distNm(p.lat, p.lon, d.lat, d.lon);
+  const near = fromO < 40 || toD < 40;
+  if (p.gnd) return near ? 0 : null;
+  const d13 = fromO / R_NM, dth = rad(bearing(o.lat, o.lon, p.lat, p.lon) - bearing(o.lat, o.lon, d.lat, d.lon));
+  const xt = Math.asin(Math.sin(d13) * Math.sin(dth)) * R_NM;
+  const at = Math.acos(Math.max(-1, Math.min(1, Math.cos(d13) / Math.cos(xt / R_NM)))) * R_NM * (Math.cos(dth) < 0 ? -1 : 1);
+  if (Math.abs(xt) > Math.max(100, 0.2 * len)) return null;
+  if (at < -50 || at > len + 50) return null;
+  if (!near && p.trk != null) {
+    const diff = Math.abs(((p.trk - bearing(p.lat, p.lon, d.lat, d.lon)) % 360 + 540) % 360 - 180);
+    if (diff > 90) return null;
+  }
+  return Math.abs(xt);
+}
+function chooseLeg(p) {
+  const c = p.lk?.cands || [];
+  let best = null;
+  for (const leg of c) {
+    const xt = legFit(p, leg.o, leg.d);
+    if (xt == null) continue;
+    const score = (leg.src === "seen" ? 1e6 : 0) + leg.days * 1e3 - xt;
+    if (!best || score > best.score) best = { ...leg, score };
+  }
+  return best;
+}
+
 function drawRoute(p) {
   if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
-  const lk = p.lk;
-  if (!lk?.origin || !lk?.dest || isNaN(lk.origin.lat) || isNaN(lk.dest.lat)) return;
+  const leg = p.leg;
+  if (!leg) return;
   const col = ui.dark ? "#6ea0ff" : "#2563eb";
-  const gc = greatCircle([lk.origin.lat, lk.origin.lon], [lk.dest.lat, lk.dest.lon]);
+  const gc = greatCircle([leg.o.lat, leg.o.lon], [leg.d.lat, leg.d.lon]);
   // Shift the arc into the world copy nearest the plane.
   const shift = Math.round((p.lon - gc[Math.floor(gc.length / 2)][1]) / 360) * 360;
   const arc = gc.map(([a, b]) => [a, b + shift]);
@@ -594,32 +681,39 @@ function drawRoute(p) {
   ]).addTo(map);
 }
 
-function routeCheck(p, lk) {
-  const o = lk.origin, d = lk.dest;
-  const total = distNm(o.lat, o.lon, d.lat, d.lon);
-  const done = distNm(o.lat, o.lon, p.lat, p.lon), left = distNm(p.lat, p.lon, d.lat, d.lon);
-  const plausible = done + left <= total * 1.3 + 150;
-  return { total, done, left, frac: Math.min(1, done / Math.max(1, done + left)), plausible };
+function routeProgress(p, leg) {
+  const done = distNm(leg.o.lat, leg.o.lon, p.lat, p.lon), left = distNm(p.lat, p.lon, leg.d.lat, leg.d.lon);
+  return { done, left, frac: Math.min(1, done / Math.max(1, done + left)) };
 }
 function apLabel(a) { return a ? esc(a.iata || a.icao || "?") : "?"; }
 function apCity(a) { return a ? esc([a.city || a.name, a.country].filter(Boolean).join(", ")) : ""; }
+function legSource(leg) {
+  if (leg.src === "adsbdb") return "From the adsbdb callsign database, not confirmed by recent flights.";
+  const caution = routesCaution === "schedule-change" ? " Airline schedules changed this week, so treat it with some caution." : "";
+  return `Flown on this route ${leg.days} of the last 7 days.${caution}`;
+}
 
 function renderInfo(p) {
   const lk = p.lk;
+  if (lk) p.leg = chooseLeg(p);
   const airline = lk?.airline?.name || (isAirline(p.cs) ? "" : (p.cs ? "Private or other operator" : ""));
   const photo = lk?.aircraft?.thumb || lk?.aircraft?.photo;
+  const plane = "M0,-9 L1.3,-7.4 L1.5,-2.6 L8.5,1.6 L8.5,3.2 L1.5,1.2 L1.1,6 L3.6,7.9 L3.6,9 L0,8.1 L-3.6,9 L-3.6,7.9 L-1.1,6 L-1.5,1.2 L-8.5,3.2 L-8.5,1.6 L-1.5,-2.6 L-1.3,-7.4 Z";
   let route = "";
   if (lk === undefined) route = `<div class="route skel">Looking up route</div>`;
-  else if (lk.origin && lk.dest) {
-    const rc = routeCheck(p, lk);
+  else if (p.leg) {
+    const leg = p.leg, rc = routeProgress(p, leg);
     route = `<div class="route">
-      <div class="ap"><div><div class="code">${apLabel(lk.origin)}</div><div class="city" title="${esc(lk.origin.name)}">${apCity(lk.origin)}</div></div>
-      <div class="r"><div class="code">${apLabel(lk.dest)}</div><div class="city" title="${esc(lk.dest.name)}">${apCity(lk.dest)}</div></div></div>
+      <div class="ap"><div><div class="code">${apLabel(leg.o)}</div><div class="city" title="${esc(leg.o.name)}">${apCity(leg.o)}</div></div>
+      <div class="r"><div class="code">${apLabel(leg.d)}</div><div class="city" title="${esc(leg.d.name)}">${apCity(leg.d)}</div></div></div>
       <div class="prog" id="prog"><i style="width:${(rc.frac * 100).toFixed(1)}%"></i>
-        <svg class="pl" style="left:${(rc.frac * 100).toFixed(1)}%" viewBox="-10 -10 20 20"><path transform="rotate(90)" fill="currentColor" d="${"M0,-9 L1.3,-7.4 L1.5,-2.6 L8.5,1.6 L8.5,3.2 L1.5,1.2 L1.1,6 L3.6,7.9 L3.6,9 L0,8.1 L-3.6,9 L-3.6,7.9 L-1.1,6 L-1.5,1.2 L-8.5,3.2 L-8.5,1.6 L-1.5,-2.6 L-1.3,-7.4 Z"}"/></svg></div>
+        <svg class="pl" style="left:${(rc.frac * 100).toFixed(1)}%" viewBox="-10 -10 20 20"><path transform="rotate(90)" fill="currentColor" d="${plane}"/></svg></div>
       <div class="note" id="rnote">${nf(rc.done)} nm flown, ${nf(rc.left)} nm to go</div>
-      ${rc.plausible ? "" : `<div class="note warn">The aircraft isn't near this route, so the callsign database may be out of date.</div>`}
+      <div class="note">${legSource(leg)}</div>
     </div>`;
+  } else if (lk.cands.length) {
+    const c = lk.cands[0];
+    route = `<div class="route"><div class="note warn">Route unconfirmed. This callsign is listed as ${apLabel(c.o)} to ${apLabel(c.d)}, but that doesn't match where the plane is or where it's heading.</div></div>`;
   } else route = `<div class="route note">No route on file for this callsign.</div>`;
 
   info.innerHTML = `
@@ -657,8 +751,13 @@ function renderStats() {
   const owner = ac?.owner ? `Operated by ${esc(ac.owner)}. ` : "";
   $("#foot").innerHTML = `${owner}${p.country ? "Registered in " + esc(p.country) + ". " : ""}Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.
     ${p.cs ? `<br><a href="https://www.flightaware.com/live/flight/${encodeURIComponent(p.cs)}" target="_blank" rel="noopener">FlightAware</a> &middot; ` : "<br>"}<a href="https://globe.adsb.lol/?icao=${p.hex}" target="_blank" rel="noopener">adsb.lol globe</a>`;
-  if (p.lk?.origin && p.lk?.dest) {
-    const rc = routeCheck(p, p.lk), n = $("#rnote"), bar = $("#prog");
+  if (p.lk) {
+    // Re-check the leg as the plane moves; redraw only if the answer changes.
+    const leg = chooseLeg(p);
+    if ((leg && `${leg.o.icao}-${leg.d.icao}`) !== (p.leg && `${p.leg.o.icao}-${p.leg.d.icao}`)) { renderInfo(p); drawRoute(p); return; }
+  }
+  if (p.leg) {
+    const rc = routeProgress(p, p.leg), n = $("#rnote"), bar = $("#prog");
     if (n) n.textContent = `${nf(rc.done)} nm flown, ${nf(rc.left)} nm to go`;
     if (bar) { bar.querySelector("i").style.width = (rc.frac * 100).toFixed(1) + "%"; bar.querySelector(".pl").style.left = (rc.frac * 100).toFixed(1) + "%"; }
   }
