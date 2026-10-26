@@ -143,7 +143,7 @@ export async function onRequestGet(context) {
     filedAlt: f.filed_altitude ? (f.filed_altitude < 1000 ? f.filed_altitude * 100 : f.filed_altitude) : null,
     filedSpeed: f.filed_airspeed || null, progress: f.progress_percent ?? null,
   };
-  const res = json({ enabled: true, flight: flight || null }, 900);
+  const res = json({ enabled: true, flight: flight || null, trackUnits: Number(env.AEROAPI_TRACK_UNITS) || 3 }, 900);
   if (cache) context.waitUntil(cache.put(key, res.clone()).catch(() => {}));
   return res;
 }

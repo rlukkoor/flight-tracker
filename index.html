@@ -60,6 +60,9 @@ button.tog{font:inherit;font-size:12.5px}
 .ihead .cs .iata{font-size:14px;font-weight:600;color:var(--muted)}
 .ihead .logo{display:block;height:30px;max-width:150px;object-fit:contain;object-position:left;margin-bottom:8px;background:#fff;border-radius:6px;padding:3px 6px}
 .tm .late{color:var(--warn)}
+.trackmsg{font-size:12px;color:var(--muted);padding:0 14px 10px;margin-top:-2px}
+.trackmsg:empty{display:none}
+.trackmsg button{font:inherit;font-size:12px;color:var(--accent);background:none;border:1px solid var(--line);border-radius:7px;padding:4px 8px;cursor:pointer;margin-top:4px}
 .ihead .al{color:var(--muted);margin-top:1px}
 .close{position:absolute;top:10px;right:10px;width:28px;height:28px;border-radius:50%;border:1px solid var(--line);background:var(--chip);
   color:var(--text);cursor:pointer;font-size:15px;line-height:1}
@@ -599,12 +602,31 @@ async function regToHex(reg) {
   } catch {}
   return null;
 }
-async function fetchTrack(hex) {
+async function fetchJsonPoints(url) {
   try {
-    const r = await fetch(`${API_TRACK}?hex=${hex}`);
+    const r = await fetch(url);
     if (r.ok && (r.headers.get("content-type") || "").includes("json")) return (await r.json()).points || [];
   } catch {}
   return [];
+}
+// Real positions from free sources: what the snapshot job recorded, plus the
+// volunteer networks' full track for today (which usually includes takeoff).
+async function fetchTrack(hex) {
+  const [mine, today] = await Promise.all([fetchJsonPoints(`${API_TRACK}?hex=${hex}`), fetchJsonPoints(`/api/trace?hex=${hex}`)]);
+  return mergeTracks(mine, today);
+}
+// Recorded history can include the aircraft's previous flight. Keep only this one:
+// from takeoff if FlightAware says when, otherwise from its last pass near the origin.
+function trimToFlight(p) {
+  const h = p.hist;
+  if (!h?.length) return;
+  const off = Date.parse(p.lk?.fa?.off?.act || "");
+  if (!isNaN(off)) { p.hist = h.filter((q) => q[0] * 1000 >= off - 600e3); return; }
+  const o = p.leg?.o;
+  if (!o) return;
+  let from = -1;
+  for (let i = h.length - 1; i >= 0; i--) if (distNm(h[i][1], h[i][2], o.lat, o.lon) < 60) { from = i; break; }
+  if (from > 0) p.hist = h.slice(from);
 }
 
 /* ---------- schedule-based positions ----------
@@ -635,9 +657,10 @@ function tryFaPath(p) {
 // including satellite ones over oceans. Fetched only for planes whose current
 // position is estimated, since it costs more than a lookup.
 const faTrackMemo = new Map();
-async function loadFaTrack(p) {
+async function loadFaTrack(p, asked) {
   const id = p.lk?.fa?.faId;
-  if (!id || !(p.synthetic || p.faPath)) return;
+  if (!id || !(asked || p.synthetic || p.faPath)) return;
+  p.faTrackAsked = true;
   let m = faTrackMemo.get(id);
   if (!m || Date.now() - m.at > 600e3) {
     m = { at: Date.now(), p: fetch(`${API_FLIGHT}?track=${encodeURIComponent(id)}`)
@@ -648,6 +671,7 @@ async function loadFaTrack(p) {
   if (ui.selected !== p.hex) return;
   if (!j?.points?.length) { if (j?.limited) { p.faTrackLimited = j.limited; renderStats(); } return; }
   p.hist = mergeTracks(p.hist, j.points.map((q) => [q[0], q[1], q[2]]));
+  trimToFlight(p);
   const last = j.points[j.points.length - 1];
   p.seenAt = last[0]; p.seenSrc = last[6];
   if (p.synthetic) { if (last[3]) p.altSeen = last[3]; if (last[4]) p.gsSeen = last[4]; }
@@ -778,11 +802,10 @@ function updateSelectionGraphics(p) {
 async function loadHistory(p) {
   try {
     if (p.synthetic && (!p.realHex || p.hist?.length)) return; // a stand-in's track was loaded when it was found
-    const r = await fetch(`${API_TRACK}?hex=${p.realHex || p.hex}`);
-    if (!r.ok || !(r.headers.get("content-type") || "").includes("json")) return;
-    const j = await r.json();
+    const pts = await fetchTrack(p.realHex || p.hex);
     if (ui.selected !== p.hex) return;
-    p.hist = mergeTracks(p.hist, j.points || []);
+    p.hist = mergeTracks(p.hist, pts);
+    trimToFlight(p);
     rebuildEstimate(p);
     updateSelectionGraphics(p);
     if (p.lk) renderInfo(p);
@@ -803,7 +826,7 @@ function select(hex, fly) {
   writeHash();
   if (fly) map.flyTo([p.lat, p.lon], Math.max(map.getZoom(), 7), { duration: 0.8 });
   loadHistory(p);
-  fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; renderInfo(p); drawRoute(p); loadFaTrack(p); } });
+  fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; trimToFlight(p); renderInfo(p); drawRoute(p); loadFaTrack(p); } });
 }
 function clearSelectionLayers() {
   if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; estLine = null; }
@@ -906,6 +929,7 @@ async function fetchLookup(p) {
   const [raw, seen, apts, als, faRes] = await Promise.all([adsbdb, cs && isAirline(cs) ? observedRoutes(cs) : [], loadAirports(), loadAirlines(), fa]);
   const out = normalize(raw);
   out.fa = faRes?.flight || null;
+  out.faTrackUnits = faRes?.trackUnits || 3;
   out.faStatus = faRes ? (faRes.limited ? "limited" : faRes.enabled ? "on" : "off") : "off";
   out.faLimit = faRes?.limited || null;
   const al = als[(cs || "").slice(0, 3)];
@@ -1132,17 +1156,39 @@ function renderInfo(p) {
     </div>
     ${photo ? `<img class="photo" src="${esc(photo)}" alt="Photo of ${esc(lk?.aircraft?.reg || "aircraft")}" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ""}
     ${route}
+    <div class="trackmsg" id="trackmsg"></div>
     <div class="grid" id="stats"></div>
     <div class="ifoot" id="foot"></div>`;
   $("#xclose").onclick = deselect;
   renderStats();
+}
+// Say when the recorded path doesn't reach back to takeoff, and offer FlightAware's track.
+function renderTrackMsg(p) {
+  const el = $("#trackmsg");
+  if (!el) return;
+  const o = p.leg?.o, h = p.hist;
+  const startNm = o && h?.length ? distNm(h[0][1], h[0][2], o.lat, o.lon) : null;
+  const complete = startNm != null && startNm < 80;
+  let html = "";
+  if (p.faTrackLimited) html = `FlightAware's ${p.faTrackLimited === "month" ? "monthly" : "daily"} lookup limit was reached, so its track couldn't be loaded.`;
+  else if (p.faTrackAsked && !complete && h?.length) html = "";
+  else if (p.faTrackAsked) html = complete ? "" : "Loading FlightAware's track...";
+  else if (o && !complete && !p.gnd) {
+    const what = startNm == null ? "No receiver recorded this flight's path yet." : `Receivers first recorded this flight ${nf(startNm)} nm from ${esc(o.iata || o.icao)}.`;
+    const units = p.lk?.faTrackUnits || 3;
+    html = p.lk?.fa?.faId
+      ? `${what}<br><button type="button" onclick="loadFaTrack(planes.get(ui.selected), true); renderStats();">Load the full path from FlightAware</button> uses ${units} of today's lookups`
+      : what;
+  }
+  if (el.innerHTML !== html) el.innerHTML = html;
 }
 function renderStats() {
   const p = planes.get(ui.selected);
   const el = $("#stats");
   if (!p || !el) return;
   const ac = p.lk?.aircraft;
-  const type = ac ? [ac.maker, ac.type].filter(Boolean).join(" ") : (p.desc || p.type || "");
+  const fa = p.lk?.fa;
+  const type = (ac && [ac.maker, ac.type].filter(Boolean).join(" ")) || p.desc || p.type || fa?.aircraftType || "";
   const vr = p.synthetic ? "Not reported" : p.vr == null ? "n/a" : Math.abs(p.vr) < 100 ? "Level" : (p.vr > 0 ? "&#9650; " : "&#9660; ") + nf(Math.abs(p.vr)) + " fpm";
   const cells = [
     ["Altitude", p.gnd ? "On ground" : p.synthetic ? (p.altSeen ? nf(p.altSeen) + " ft" : p.altFiled ? nf(p.altFiled) + " ft (filed)" : "Out of range") : p.alt != null ? nf(p.alt) + " ft" : "n/a"],
@@ -1150,7 +1196,7 @@ function renderStats() {
     ["Heading", p.trk != null ? Math.round(p.trk) + "&deg;" : "n/a"],
     ["Vertical", vr],
     ["Aircraft", esc(type || "Unknown")],
-    ["Registration", esc(ac?.reg || p.reg || "n/a")],
+    ["Registration", esc(ac?.reg || p.reg || fa?.registration || "n/a")],
     ["Squawk", p.synthetic ? "Out of range" : esc(p.sq || "n/a")],
     ["ICAO hex", p.synthetic ? (p.realHex ? p.realHex.toUpperCase() : "n/a") : p.hex.toUpperCase()],
   ];
@@ -1178,6 +1224,7 @@ function renderStats() {
     const ta = $("#tarr");
     if (ta) ta.innerHTML = arrHtml(p, legTimes(p, p.leg));
   }
+  renderTrackMsg(p);
   updateSelectionGraphics(p);
 }
 
