@@ -87,6 +87,10 @@ export async function onRequestGet(context) {
     on: { sched: f.scheduled_on, est: f.estimated_on, act: f.actual_on },
     in: { sched: f.scheduled_in, est: f.estimated_in, act: f.actual_in },
     depDelay: f.departure_delay, arrDelay: f.arrival_delay,
+    registration: f.registration || null, aircraftType: f.aircraft_type || null,
+    // AeroAPI gives filed altitude in hundreds of feet (350 = 35,000 ft)
+    filedAlt: f.filed_altitude ? (f.filed_altitude < 1000 ? f.filed_altitude * 100 : f.filed_altitude) : null,
+    filedSpeed: f.filed_airspeed || null, progress: f.progress_percent ?? null,
   };
   const res = json({ enabled: true, flight: flight || null }, 900);
   if (cache) context.waitUntil(cache.put(key, res.clone()).catch(() => {}));

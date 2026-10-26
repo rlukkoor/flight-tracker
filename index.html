@@ -541,7 +541,7 @@ function prune() {
     if (p.synthetic) {
       // A stand-in placed from FlightAware's schedule. Swap in the real plane once a receiver sees it.
       if (!byCs) { byCs = new Map(); for (const q of planes.values()) if (!q.synthetic && !q.faPath && q.cs) byCs.set(q.cs, q); }
-      const real = byCs.get(p.cs);
+      const real = byCs.get(p.cs) || (p.realHex && planes.get(p.realHex));
       if (real) {
         planes.delete(hex);
         if (ui.selected === hex) { ui.selected = null; clearSelectionLayers(); select(real.hex); }
@@ -566,6 +566,47 @@ function prune() {
   }
 }
 
+// US N-number -> ICAO 24-bit address (hex). The FAA assigns them in a fixed order.
+function nNumberToHex(reg) {
+  const L = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I or O
+  const SUF = 601, B4 = 35, B3 = 951, B2 = 10111, B1 = 101711;
+  const t = (reg || "").toUpperCase().replace(/-/g, "");
+  if (!/^N[1-9][0-9A-HJ-NP-Z]{0,4}$/.test(t)) return null;
+  const s = t.slice(1);
+  const suffix = (x) => (x.length ? L.indexOf(x[0]) * 25 + 1 + (x.length > 1 ? L.indexOf(x[1]) + 1 : 0) : 0);
+  const isL = (c) => c != null && L.includes(c);
+  let out = 0xa00001 + (+s[0] - 1) * B1;
+  const sizes = [B2, B3, B4];
+  for (let i = 1; i < s.length; i++) {
+    if (isL(s[i])) {
+      if (i === 4) return (out + 1 + L.indexOf(s[i])).toString(16); // N1234Z: one letter after four digits
+      if (s.length - i > 2 || [...s.slice(i)].some((c) => !isL(c))) return null;
+      return (out + suffix(s.slice(i))).toString(16);
+    }
+    if (i === 4) { out += 1 + 24 + +s[i]; return out.toString(16); }
+    out += SUF + +s[i] * sizes[i - 1];
+  }
+  return out.toString(16);
+}
+// Transponder code for a registration: computed for US tails, looked up otherwise.
+async function regToHex(reg) {
+  if (!reg) return null;
+  const n = nNumberToHex(reg);
+  if (n) return n;
+  try {
+    const r = await fetch(`${API_LOOKUP}?reg=${encodeURIComponent(reg)}`);
+    if ((r.headers.get("content-type") || "").includes("json")) return (await r.json()).hex || null;
+  } catch {}
+  return null;
+}
+async function fetchTrack(hex) {
+  try {
+    const r = await fetch(`${API_TRACK}?hex=${hex}`);
+    if (r.ok && (r.headers.get("content-type") || "").includes("json")) return (await r.json()).points || [];
+  } catch {}
+  return [];
+}
+
 /* ---------- schedule-based positions ----------
    Over oceans there are no ground receivers. Like FlightAware, place the plane
    along the shortest route by how far through its scheduled flight time it is. */
@@ -586,8 +627,17 @@ function faTimes(fa) {
 function tryFaPath(p) {
   const t = faTimes(p.lk?.fa), leg = p.leg;
   if (!t || leg?.src !== "fa") return false;
-  setFaPath(p, leg.o, leg.d, t.off, t.on);
+  // Continue from where a receiver last saw it, toward the destination, arriving on FlightAware's estimate.
+  setFaPath(p, { lat: p.lat, lon: p.lon }, leg.d, Math.max(t.off, (p.t || 0) * 1000), t.on);
   return true;
+}
+// For a stand-in: start the estimate from the last recorded position, if the
+// snapshot job saw this aircraft earlier in the flight.
+function faPathFromHistory(p, o, d, t) {
+  const last = p.hist?.[p.hist.length - 1];
+  if (last && last[0] * 1000 >= t.off - 600e3 && last[0] * 1000 < t.on) {
+    setFaPath(p, { lat: last[1], lon: last[2] }, d, last[0] * 1000, t.on);
+  } else setFaPath(p, o, d, t.off, t.on);
 }
 // For a searched flight that isn't on the map: ask FlightAware where it should be.
 async function findViaFlightAware(id) {
@@ -605,11 +655,19 @@ async function findViaFlightAware(id) {
   }
   const apts = await loadAirports(), o = apts[og.icao], d = apts[ds.icao], t = faTimes(f);
   if (!o || !d || !t) return { msg: `${esc(id)} is in the air but couldn't be placed on the map. ${link}` };
+  // Identify the actual aircraft, so its recorded track and details can be used.
+  const realHex = await regToHex(f.registration);
+  const real = realHex && planes.get(realHex);
+  if (real && !real.synthetic) return { p: real }; // it's on the map under another callsign
   const key = "fa:" + id;
   let p = planes.get(key);
   if (!p) { p = { hex: key, synthetic: true, cs: id, est: true, gnd: false, alt: null, vr: null }; planes.set(key, p); }
-  setFaPath(p, { lat: o[4], lon: o[5] }, { lat: d[4], lon: d[5] }, t.off, t.on);
-  p.gs = distNm(o[4], o[5], d[4], d[5]) / ((t.on - t.off) / 3600e3);
+  Object.assign(p, { realHex, reg: f.registration || null, type: f.aircraftType || null, altFiled: f.filedAlt, spdFiled: f.filedSpeed });
+  p.hist = realHex ? await fetchTrack(realHex) : [];
+  const O = { lat: o[4], lon: o[5] }, D = { lat: d[4], lon: d[5] };
+  faPathFromHistory(p, O, D, t);
+  p.gs = f.filedSpeed || distNm(o[4], o[5], d[4], d[5]) / ((t.on - t.off) / 3600e3);
+  p.alt = f.filedAlt || null;
   p.t = Date.now() / 1000;
   curPos(p, p.t);
   return { p };
@@ -617,7 +675,7 @@ async function findViaFlightAware(id) {
 
 /* ---------- selection, route and info panel ---------- */
 const info = $("#info");
-let routeLayer = null, trailLine = null, remainLine = null, gapLine = null;
+let routeLayer = null, trailLine = null, remainLine = null, gapLine = null, estLine = null;
 const API_TRACK = "/api/track";
 function pushTrail(p) {
   p.trail ||= [];
@@ -643,19 +701,33 @@ function updateSelectionGraphics(p) {
   const [la, lo] = curPos(p, Date.now() / 1000);
   const here = [la, shiftNear(lo, map.getCenter().lng)];
   if (trailLine) {
+    // Real positions: the recorded history, then points seen live since selecting.
     const histEnd = p.hist?.length ? p.hist[p.hist.length - 1][0] : 0;
-    const pts = [...(p.hist || []).map((h) => [h[1], h[2]]), ...(p.trail || []).filter((_, i) => i > 0 || !histEnd), [la, lo]];
-    // Start the track at the origin airport when it reaches back there.
-    // Otherwise mark the untracked stretch with a faint dotted line.
+    const real = [...(p.hist || []).map((h) => [h[1], h[2]]), ...(p.synthetic ? [] : (p.trail || []).filter((_, i) => i > 0 || !histEnd))];
+    // An estimated plane isn't at the end of its real track: the estimate starts where the track ends.
+    const estStart = p.faPath ? p.faPath.pts[0] : null;
+    const pts = [...real, ...(p.faPath ? [estStart] : []), [la, lo]];
+    // Start the track at the origin airport when it reaches back there; otherwise
+    // mark the untracked stretch with a faint dotted line.
     const o = p.leg?.o;
-    const reachesOrigin = o && distNm(pts[0][0], pts[0][1], o.lat, o.lon) < 80;
-    if (reachesOrigin) pts.unshift([o.lat, o.lon]);
-    const u = unwrap(pts), last = u[u.length - 1], k = here[1] - last[1];
-    const trail = u.map(([a, b]) => [a, b + k]);
-    trailLine.setLatLngs(trail);
+    const first = pts[0];
+    const reachesOrigin = o && distNm(first[0], first[1], o.lat, o.lon) < 80;
+    if (reachesOrigin && real.length) pts.unshift([o.lat, o.lon]);
+    const u = unwrap(pts), k = here[1] - u[u.length - 1][1];
+    const all = u.map(([a, b]) => [a, b + k]);
+    // Solid line: real positions only. Dotted: from the last real position to the plane.
+    const solid = p.faPath ? all.slice(0, all.length - 2) : all; // drop the estimate's start and the plane
+    trailLine.setLatLngs(solid.length > 1 ? solid : []);
+    if (estLine) {
+      if (p.faPath) {
+        const s0 = all[all.length - 2], gc = greatCircle(s0, here, 48), g = here[1] - gc[gc.length - 1][1];
+        estLine.setLatLngs(gc.map(([a, b]) => [a, b + g]));
+      } else estLine.setLatLngs([]);
+    }
     if (gapLine) {
-      if (o && !reachesOrigin) {
-        const gc = greatCircle([o.lat, o.lon], trail[0], 48), g = trail[0][1] - gc[gc.length - 1][1];
+      const start = solid.length > 1 ? solid[0] : all[all.length - 2] || here;
+      if (o && distNm(start[0], start[1], o.lat, o.lon) > 30) {
+        const gc = greatCircle([o.lat, o.lon], start, 48), g = start[1] - gc[gc.length - 1][1];
         gapLine.setLatLngs(gc.map(([a, b]) => [a, b + g]));
       } else gapLine.setLatLngs([]);
     }
@@ -668,7 +740,8 @@ function updateSelectionGraphics(p) {
 }
 async function loadHistory(p) {
   try {
-    const r = await fetch(`${API_TRACK}?hex=${p.hex}`);
+    if (p.synthetic && (!p.realHex || p.hist?.length)) return; // a stand-in's track was loaded when it was found
+    const r = await fetch(`${API_TRACK}?hex=${p.realHex || p.hex}`);
     if (!r.ok || !(r.headers.get("content-type") || "").includes("json")) return;
     const j = await r.json();
     if (ui.selected !== p.hex) return;
@@ -683,7 +756,7 @@ function select(hex, fly) {
   if (ui.selected && ui.selected !== hex) clearSelectionLayers();
   ui.selected = hex;
   p.trail = [[p.lat, p.lon]];
-  p.hist = null;
+  if (!p.synthetic) p.hist = null;
   if (!trailLine) trailLine = L.polyline([], { color: ui.dark ? "#6ea0ff" : "#2563eb", weight: 2.5, opacity: 0.9, interactive: false }).addTo(map);
   updateSelectionGraphics(p);
   info.classList.add("open");
@@ -695,7 +768,7 @@ function select(hex, fly) {
   fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; renderInfo(p); drawRoute(p); } });
 }
 function clearSelectionLayers() {
-  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; }
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; estLine = null; }
   if (trailLine) { map.removeLayer(trailLine); trailLine = null; }
 }
 function deselect() {
@@ -781,12 +854,12 @@ async function fetchLookup(p) {
   if (lookups.has(key)) return lookups.get(key);
   const adsbdb = (async () => {
     try {
-      const r = await fetch(`${API_LOOKUP}?cs=${encodeURIComponent(cs)}&hex=${p.hex}`);
+      const r = await fetch(`${API_LOOKUP}?cs=${encodeURIComponent(cs)}&hex=${p.realHex || p.hex}`);
       if (r.ok && (r.headers.get("content-type") || "").includes("json")) return await r.json();
     } catch {}
     // No proxy (for example opened locally): try adsbdb directly.
     const g = async (path) => { try { return await (await fetch(ADSBDB + path)).json(); } catch { return null; } };
-    const [route, aircraft] = await Promise.all([cs ? g("callsign/" + cs) : null, g("aircraft/" + p.hex)]);
+    const [route, aircraft] = await Promise.all([cs ? g("callsign/" + cs) : null, g("aircraft/" + (p.realHex || p.hex))]);
     return { route, aircraft };
   })();
   const fa = cs && isAirline(cs)
@@ -862,15 +935,16 @@ function chooseLeg(p) {
 }
 
 function drawRoute(p) {
-  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; }
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; remainLine = null; gapLine = null; estLine = null; }
   const leg = p.leg;
   if (!leg) return;
   const col = ui.dark ? "#6ea0ff" : "#2563eb";
   const ref = shiftNear(p.lon, map.getCenter().lng);
   remainLine = L.polyline([], { color: col, weight: 1.6, opacity: 0.75, dashArray: "5 6", interactive: false });
   gapLine = L.polyline([], { color: col, weight: 1.6, opacity: 0.4, dashArray: "1 6", lineCap: "round", interactive: false });
+  estLine = L.polyline([], { color: col, weight: 2.2, opacity: 0.75, dashArray: "1 5", lineCap: "round", interactive: false });
   routeLayer = L.layerGroup([
-    remainLine, gapLine,
+    remainLine, gapLine, estLine,
     L.circleMarker([leg.o.lat, shiftNear(leg.o.lon, ref)], { radius: 4, color: col, weight: 2, fillColor: "#fff", fillOpacity: 1, interactive: false }),
     L.circleMarker([leg.d.lat, shiftNear(leg.d.lon, ref)], { radius: 4, color: col, weight: 2, fillColor: col, fillOpacity: 1, interactive: false }),
   ]).addTo(map);
@@ -1031,27 +1105,27 @@ function renderStats() {
   if (!p || !el) return;
   const ac = p.lk?.aircraft;
   const type = ac ? [ac.maker, ac.type].filter(Boolean).join(" ") : (p.desc || p.type || "");
-  const vr = p.vr == null ? "n/a" : Math.abs(p.vr) < 100 ? "Level" : (p.vr > 0 ? "&#9650; " : "&#9660; ") + nf(Math.abs(p.vr)) + " fpm";
+  const vr = p.synthetic ? "Not reported" : p.vr == null ? "n/a" : Math.abs(p.vr) < 100 ? "Level" : (p.vr > 0 ? "&#9650; " : "&#9660; ") + nf(Math.abs(p.vr)) + " fpm";
   const cells = [
-    ["Altitude", p.gnd ? "On ground" : p.alt != null ? nf(p.alt) + " ft" : "n/a"],
-    [p.synthetic ? "Avg. speed" : "Ground speed", p.gs != null ? nf(p.gs) + " kt" : "n/a"],
+    ["Altitude", p.gnd ? "On ground" : p.synthetic ? (p.altFiled ? nf(p.altFiled) + " ft (filed)" : "Out of range") : p.alt != null ? nf(p.alt) + " ft" : "n/a"],
+    [p.synthetic ? "Speed" : "Ground speed", p.synthetic ? (p.spdFiled ? nf(p.spdFiled) + " kt (filed)" : p.gs ? "~" + nf(p.gs) + " kt avg." : "n/a") : p.gs != null ? nf(p.gs) + " kt" : "n/a"],
     ["Heading", p.trk != null ? Math.round(p.trk) + "&deg;" : "n/a"],
     ["Vertical", vr],
     ["Aircraft", esc(type || "Unknown")],
     ["Registration", esc(ac?.reg || p.reg || "n/a")],
-    ["Squawk", esc(p.sq || "n/a")],
-    ["ICAO hex", p.synthetic ? "n/a" : p.hex.toUpperCase()],
+    ["Squawk", p.synthetic ? "Out of range" : esc(p.sq || "n/a")],
+    ["ICAO hex", p.synthetic ? (p.realHex ? p.realHex.toUpperCase() : "n/a") : p.hex.toUpperCase()],
   ];
   el.innerHTML = cells.map(([k, v]) => `<div><div class="k">${k}</div><div class="v" title="${String(v).replace(/<[^>]+>|&[a-z#0-9]+;/g, "")}">${v}</div></div>`).join("");
   const age = p.t ? Date.now() / 1000 - p.t : null;
   const owner = ac?.owner ? `Operated by ${esc(ac.owner)}. ` : "";
   const estNote = p.faPath
-    ? `<span class="late">Estimated position, placed along the shortest route using FlightAware's takeoff and arrival times. No receiver is in range, which is normal over open ocean. The real track can differ by a few hundred miles.</span><br>`
+    ? `<span class="late">Estimated position. No receiver is in range, which is normal over open ocean, so the plane is placed along the shortest route from ${p.hist?.length || !p.synthetic ? "where it was last seen" : "its origin"}, timed to FlightAware's arrival estimate. The solid line is where receivers actually tracked it; the dotted line is estimated and can be off by a few hundred miles.</span><br>`
     : p.est ? `<span class="late">Estimated position. No receiver has picked this plane up for ${fmtDur(Date.now() - p.t * 1000)}, usually because it's out of range over water or remote land.</span><br>` : "";
   const from = p.faPath ? "" : `Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.`;
   const links = [
     p.cs && `<a href="https://www.flightaware.com/live/flight/${encodeURIComponent(p.cs)}" target="_blank" rel="noopener">FlightAware</a>`,
-    !p.synthetic && `<a href="https://globe.adsb.lol/?icao=${p.hex}" target="_blank" rel="noopener">adsb.lol globe</a>`,
+    (!p.synthetic || p.realHex) && `<a href="https://globe.adsb.lol/?icao=${p.realHex || p.hex}" target="_blank" rel="noopener">adsb.lol globe</a>`,
   ].filter(Boolean).join(" &middot; ");
   $("#foot").innerHTML = `${estNote}${owner}${p.country ? "Registered in " + esc(p.country) + ". " : ""}${from}<br>${links}`;
   if (p.lk) {
