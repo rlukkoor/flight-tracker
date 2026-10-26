@@ -122,15 +122,16 @@ button.tog{font:inherit;font-size:12.5px}
 <div id="info" class="panel" aria-live="polite"></div>
 <div id="tip"></div>
 
+<script src="/api/config.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 "use strict";
 
 /* ---------- config ---------- */
-// Paste your CARTO basemaps key here. It's visible in the page source by design,
-// so restrict it to your site's domain in the CARTO dashboard.
-// Leave empty to use keyless Esri gray canvas tiles instead.
-const CARTO_KEY = "cb1_3o6i_4_e9b184ad467134017db51332";
+// The CARTO basemaps key comes from the CARTO_KEY environment variable in your
+// Cloudflare Pages settings (served by functions/api/config.js), so this file
+// never needs editing. Without it, keyless Esri gray canvas tiles are used.
+const CARTO_KEY = window.FT_CONFIG?.cartoKey || "";
 const API_STATES = "/api/states";
 const API_LOOKUP = "/api/lookup";
 const API_FLIGHT = "/api/flight";
@@ -1092,6 +1093,12 @@ q.addEventListener("input", () => {
   ui.qAlt = toCallsign(ui.q);
   $("#qmsg").innerHTML = "";
   queueDraw();
+  const id = ui.qAlt || ui.q;
+  if (id.length >= 4 && isAirline(id)) {
+    let any = false;
+    for (const p of planes.values()) if (p.cs === id) { any = true; break; }
+    if (!any) $("#qmsg").textContent = `${id} isn't on the map. Press Enter to look it up on FlightAware.`;
+  }
 });
 loadAirlines();
 q.addEventListener("keydown", async (e) => {
@@ -1101,7 +1108,8 @@ q.addEventListener("keydown", async (e) => {
   let best = null;
   for (const p of planes.values()) {
     if (p.cs === Q || (alt && p.cs === alt) || p.hex === Ql || (p.reg && p.reg.replace(/-/g, "") === Q.replace(/-/g, ""))) { best = p; break; }
-    if (!best && matchesQuery(p)) best = p;
+    // A partial match (UAL18 finding UAL1891) only counts when the search isn't a full flight number.
+    if (!best && !isAirline(alt || Q) && matchesQuery(p)) best = p;
   }
   if (best) { select(best.hex, true); q.blur(); return; }
   const id = alt || Q;
