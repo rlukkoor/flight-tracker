@@ -263,6 +263,11 @@ let hitX = new Float32Array(0), hitY = new Float32Array(0), hitP = [], hitN = 0;
 let dpr = 1, cw = 0, ch = 0, zooming = false, lastDraw = 0, drawQueued = false;
 
 function curPos(p, nowS) {
+  if (p.faPath) {
+    const [la, lo, h] = faPos(p, nowS * 1000);
+    p.lat = la; p.lon = ((lo + 540) % 360) - 180; p.trk = h;
+    return [p.lat, p.lon];
+  }
   if (p.gnd || !(p.gs > 40) || p.trk == null || !p.t) return [p.lat, p.lon];
   const dt = Math.min(Math.max(nowS - p.t, 0), p.est ? EST_MAX_S : MAX_EXTRAP);
   return dt > 0.5 ? project(p.lat, p.lon, p.trk, (p.gs * dt) / 3600) : [p.lat, p.lon];
@@ -469,6 +474,7 @@ async function loadRegional() {
       const res = await fetch(src.url(la, lo, r), { signal: ac.signal, cache: "no-store" });
       if (res.status === 429) { limited = true; throw new Error("rate limited"); }
       if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!(res.headers.get("content-type") || "").includes("json")) throw new Error("unavailable");
       const d = await res.json();
       ingestLive(d);
       Object.assign(rMeta, { ok: true, at: Date.now(), src: d.src ? `${d.src} via your site` : src.name, err: "", fails: 0, pref: i, count: (d.ac || []).length });
@@ -523,13 +529,83 @@ function ingestLive(d) {
 const EST_MAX_S = 1800;
 function prune() {
   const now = Date.now();
+  let byCs = null;
   for (const [hex, p] of planes) {
-    if ((p.gid === gid && gid > 0) || (p.liveSeen && now - p.liveSeen < 90000)) { p.est = false; continue; }
+    if (p.synthetic) {
+      // A stand-in placed from FlightAware's schedule. Swap in the real plane once a receiver sees it.
+      if (!byCs) { byCs = new Map(); for (const q of planes.values()) if (!q.synthetic && !q.faPath && q.cs) byCs.set(q.cs, q); }
+      const real = byCs.get(p.cs);
+      if (real) {
+        planes.delete(hex);
+        if (ui.selected === hex) { ui.selected = null; clearSelectionLayers(); select(real.hex); }
+        continue;
+      }
+      if (now < p.faPath.on + 600e3 || hex === ui.selected) continue;
+      planes.delete(hex);
+      continue;
+    }
+    if ((p.gid === gid && gid > 0) || (p.liveSeen && now - p.liveSeen < 90000)) { p.est = false; delete p.faPath; continue; }
+    if (p.faPath) {
+      if (now < p.faPath.on + 600e3 || hex === ui.selected) { p.est = true; continue; }
+      planes.delete(hex);
+      continue;
+    }
     const cruising = !p.gnd && p.gs > 150 && p.alt > 15000 && p.trk != null;
     if (cruising && now / 1000 - p.t < EST_MAX_S) { p.est = true; continue; }
+    // Out of range for over 30 minutes: if FlightAware gave us its schedule, follow that instead.
+    if (!p.gnd && tryFaPath(p)) { p.est = true; continue; }
     if (hex === ui.selected) { p.est = true; continue; }
     planes.delete(hex);
   }
+}
+
+/* ---------- schedule-based positions ----------
+   Over oceans there are no ground receivers. Like FlightAware, place the plane
+   along the shortest route by how far through its scheduled flight time it is. */
+function setFaPath(p, o, d, offMs, onMs) {
+  p.faPath = { pts: greatCircle([o.lat, o.lon], [d.lat, d.lon], 256), off: offMs, on: onMs };
+}
+function faPos(p, nowMs) {
+  const fp = p.faPath, n = fp.pts.length - 1;
+  const f = Math.min(1, Math.max(0, (nowMs - fp.off) / Math.max(1, fp.on - fp.off)));
+  const x = f * n, i = Math.min(n - 1, Math.floor(x)), t = x - i;
+  const a = fp.pts[i], b = fp.pts[i + 1];
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, bearing(a[0], a[1], b[0], b[1])];
+}
+function faTimes(fa) {
+  const off = Date.parse(fa?.off?.act || ""), on = Date.parse(fa?.on?.est || fa?.on?.sched || "");
+  return fa && !fa.on?.act && !isNaN(off) && !isNaN(on) && on > Date.now() ? { off, on } : null;
+}
+function tryFaPath(p) {
+  const t = faTimes(p.lk?.fa), leg = p.leg;
+  if (!t || leg?.src !== "fa") return false;
+  setFaPath(p, leg.o, leg.d, t.off, t.on);
+  return true;
+}
+// For a searched flight that isn't on the map: ask FlightAware where it should be.
+async function findViaFlightAware(id) {
+  const link = `<a href="https://www.flightaware.com/live/flight/${encodeURIComponent(id)}" target="_blank" rel="noopener">Check FlightAware</a>`;
+  const j = await getFlightAware(id);
+  if (!j?.enabled || j.error) return { msg: `${esc(id)} isn't on the map right now. It may not have taken off yet, may have landed, or may be out of receiver range. ${link}` };
+  if (j.limited) return { msg: `${esc(id)} isn't on the map, and FlightAware's ${j.limited === "month" ? "monthly" : "daily"} lookup limit has been reached. ${link}` };
+  const f = j.flight;
+  if (!f) return { msg: `FlightAware has no current flight ${esc(id)}. ${link}` };
+  const og = f.origin || {}, ds = f.destination || {};
+  if (f.on?.act) return { msg: `${esc(id)} landed at ${esc(ds.iata || ds.icao)} at ${fmtAt(f.on.act, ds.tz)}. ${link}` };
+  if (!f.off?.act) {
+    const dep = f.out?.est || f.out?.sched;
+    return { msg: `${esc(id)} hasn't taken off yet${dep ? `. It's due to leave ${esc(og.iata || og.icao)} at ${fmtAt(dep, og.tz)}` : ""}. ${link}` };
+  }
+  const apts = await loadAirports(), o = apts[og.icao], d = apts[ds.icao], t = faTimes(f);
+  if (!o || !d || !t) return { msg: `${esc(id)} is in the air but couldn't be placed on the map. ${link}` };
+  const key = "fa:" + id;
+  let p = planes.get(key);
+  if (!p) { p = { hex: key, synthetic: true, cs: id, est: true, gnd: false, alt: null, vr: null }; planes.set(key, p); }
+  setFaPath(p, { lat: o[4], lon: o[5] }, { lat: d[4], lon: d[5] }, t.off, t.on);
+  p.gs = distNm(o[4], o[5], d[4], d[5]) / ((t.on - t.off) / 3600e3);
+  p.t = Date.now() / 1000;
+  curPos(p, p.t);
+  return { p };
 }
 
 /* ---------- selection, route and info panel ---------- */
@@ -637,6 +713,17 @@ const ROUTES_CDN = "https://cdn.jsdelivr.net/gh/GumDropSoftware/overhead-routes"
 let airportsP = null, routesBaseP = null, routesCaution = null;
 const airlineRoutes = new Map();
 let airlinesP = null, airportsData = null, airlinesByIata = null;
+// FlightAware answers, remembered for 15 minutes so a search and a click share one lookup.
+const faMemo = new Map();
+function getFlightAware(cs) {
+  const hit = faMemo.get(cs);
+  if (hit && Date.now() - hit.at < 900e3) return hit.p;
+  const p = fetch(`${API_FLIGHT}?cs=${encodeURIComponent(cs)}`)
+    .then((r) => ((r.headers.get("content-type") || "").includes("json") ? r.json() : null))
+    .catch(() => null);
+  faMemo.set(cs, { at: Date.now(), p });
+  return p;
+}
 function loadAirlines() {
   return (airlinesP ||= fetch("airlines.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})).then((d) => {
     airlinesByIata = {};
@@ -696,7 +783,7 @@ async function fetchLookup(p) {
     return { route, aircraft };
   })();
   const fa = cs && isAirline(cs)
-    ? fetch(`${API_FLIGHT}?cs=${encodeURIComponent(cs)}`).then((r) => ((r.headers.get("content-type") || "").includes("json") ? r.json() : null)).catch(() => null)
+    ? getFlightAware(cs)
     : null;
   const [raw, seen, apts, als, faRes] = await Promise.all([adsbdb, cs && isAirline(cs) ? observedRoutes(cs) : [], loadAirports(), loadAirlines(), fa]);
   const out = normalize(raw);
@@ -940,20 +1027,26 @@ function renderStats() {
   const vr = p.vr == null ? "n/a" : Math.abs(p.vr) < 100 ? "Level" : (p.vr > 0 ? "&#9650; " : "&#9660; ") + nf(Math.abs(p.vr)) + " fpm";
   const cells = [
     ["Altitude", p.gnd ? "On ground" : p.alt != null ? nf(p.alt) + " ft" : "n/a"],
-    ["Ground speed", p.gs != null ? nf(p.gs) + " kt" : "n/a"],
+    [p.synthetic ? "Avg. speed" : "Ground speed", p.gs != null ? nf(p.gs) + " kt" : "n/a"],
     ["Heading", p.trk != null ? Math.round(p.trk) + "&deg;" : "n/a"],
     ["Vertical", vr],
     ["Aircraft", esc(type || "Unknown")],
     ["Registration", esc(ac?.reg || p.reg || "n/a")],
     ["Squawk", esc(p.sq || "n/a")],
-    ["ICAO hex", p.hex.toUpperCase()],
+    ["ICAO hex", p.synthetic ? "n/a" : p.hex.toUpperCase()],
   ];
   el.innerHTML = cells.map(([k, v]) => `<div><div class="k">${k}</div><div class="v" title="${String(v).replace(/<[^>]+>|&[a-z#0-9]+;/g, "")}">${v}</div></div>`).join("");
   const age = p.t ? Date.now() / 1000 - p.t : null;
   const owner = ac?.owner ? `Operated by ${esc(ac.owner)}. ` : "";
-  const estNote = p.est ? `<span class="late">Estimated position. No receiver has picked this plane up for ${fmtDur(Date.now() - p.t * 1000)}, usually because it's out of range over water or remote land.</span><br>` : "";
-  $("#foot").innerHTML = `${estNote}${owner}${p.country ? "Registered in " + esc(p.country) + ". " : ""}Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.
-    ${p.cs ? `<br><a href="https://www.flightaware.com/live/flight/${encodeURIComponent(p.cs)}" target="_blank" rel="noopener">FlightAware</a> &middot; ` : "<br>"}<a href="https://globe.adsb.lol/?icao=${p.hex}" target="_blank" rel="noopener">adsb.lol globe</a>`;
+  const estNote = p.faPath
+    ? `<span class="late">Estimated position, placed along the shortest route using FlightAware's takeoff and arrival times. No receiver is in range, which is normal over open ocean. The real track can differ by a few hundred miles.</span><br>`
+    : p.est ? `<span class="late">Estimated position. No receiver has picked this plane up for ${fmtDur(Date.now() - p.t * 1000)}, usually because it's out of range over water or remote land.</span><br>` : "";
+  const from = p.faPath ? "" : `Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.`;
+  const links = [
+    p.cs && `<a href="https://www.flightaware.com/live/flight/${encodeURIComponent(p.cs)}" target="_blank" rel="noopener">FlightAware</a>`,
+    !p.synthetic && `<a href="https://globe.adsb.lol/?icao=${p.hex}" target="_blank" rel="noopener">adsb.lol globe</a>`,
+  ].filter(Boolean).join(" &middot; ");
+  $("#foot").innerHTML = `${estNote}${owner}${p.country ? "Registered in " + esc(p.country) + ". " : ""}${from}<br>${links}`;
   if (p.lk) {
     // Re-check the leg as the plane moves; redraw only if the answer changes.
     const leg = chooseLeg(p);
@@ -1001,7 +1094,7 @@ q.addEventListener("input", () => {
   queueDraw();
 });
 loadAirlines();
-q.addEventListener("keydown", (e) => {
+q.addEventListener("keydown", async (e) => {
   if (e.key === "Escape") { q.value = ""; ui.q = ""; queueDraw(); q.blur(); return; }
   if (e.key !== "Enter" || !ui.q) return;
   const Q = ui.q, Ql = Q.toLowerCase(), alt = ui.qAlt;
@@ -1012,7 +1105,13 @@ q.addEventListener("keydown", (e) => {
   }
   if (best) { select(best.hex, true); q.blur(); return; }
   const id = alt || Q;
-  $("#qmsg").innerHTML = `${esc(id)} isn't on the map right now. It may not have taken off yet, may have landed, or may be out of receiver range for over 30 minutes. <a href="https://www.flightaware.com/live/flight/${encodeURIComponent(id)}" target="_blank" rel="noopener">Check FlightAware</a>`;
+  const link = `<a href="https://www.flightaware.com/live/flight/${encodeURIComponent(id)}" target="_blank" rel="noopener">Check FlightAware</a>`;
+  if (!isAirline(id)) { $("#qmsg").innerHTML = `${esc(id)} isn't on the map right now. ${link}`; return; }
+  $("#qmsg").textContent = `${id} isn't in range of a receiver. Asking FlightAware where it is...`;
+  const res = await findViaFlightAware(id);
+  if (ui.q !== Q) return; // the search changed while we waited
+  if (res.p) { $("#qmsg").innerHTML = ""; select(res.p.hex, true); q.blur(); }
+  else $("#qmsg").innerHTML = res.msg;
 });
 $("#fAir").addEventListener("change", (e) => { ui.airlinesOnly = e.target.checked; queueDraw(); });
 $("#fGnd").addEventListener("change", (e) => { ui.showGround = e.target.checked; queueDraw(); });
