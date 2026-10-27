@@ -229,10 +229,13 @@ async function kvPut(key, body) {
    Text format, so /api/track can find one flight with indexOf instead of
    parsing the whole thing:
      T <baseMinute>
-     <hex>|<min>,<lat>,<lon>;<min>,<lat>,<lon>;...
-   where min is minutes after baseMinute. */
-function parseTracks(txt) {
-  const tracks = new Map();
+     <hex>|<min>,<lat>,<lon>,<alt>,<gs>;...
+   min: minutes after baseMinute. alt: hundreds of feet, or "g" on the ground.
+   gs: ground speed in knots. Older files have only min,lat,lon.
+   With R2 the history is split into 16 files by the last character of the
+   transponder code (tracks/0 ... tracks/f), so the site reads small files. */
+const SHARDS = "0123456789abcdef".split("");
+export function parseTracks(txt, tracks = new Map()) {
   if (!txt) return tracks;
   const lines = txt.split("\n");
   const base = Number((lines[0] || "").split(" ")[1]) || 0;
@@ -240,38 +243,51 @@ function parseTracks(txt) {
     const [hex, pts] = lines[i].split("|");
     if (!hex || !pts) continue;
     tracks.set(hex, pts.split(";").map((p) => {
-      const [m, la, lo] = p.split(",");
-      return [base + Number(m), la, lo];
+      const [m, la, lo, al = "", g = ""] = p.split(",");
+      return [base + Number(m), la, lo, al, g];
     }));
   }
   return tracks;
 }
-function updateTracks(tracks, rows, nowMin) {
+export function updateTracks(tracks, rows, nowMin) {
   for (const a of rows) {
-    if (a[6]) continue; // skip aircraft on the ground
+    const gnd = !!a[6];
     const minute = Math.floor(a[10] / 60) || nowMin;
-    const pt = [minute, a[4].toFixed(2), a[3].toFixed(2)];
+    const alt = gnd ? "g" : a[5] == null ? "" : String(Math.max(0, Math.round((a[5] * 3.28084) / 100)));
+    const gs = a[7] == null ? "" : String(Math.round(a[7] * 1.943844));
+    const pt = [minute, a[4].toFixed(2), a[3].toFixed(2), alt, gs];
     const t = tracks.get(a[0]);
-    if (!t) tracks.set(a[0], [pt]);
-    else if (t[t.length - 1][0] < minute) t.push(pt);
+    if (!t) { tracks.set(a[0], [pt]); continue; }
+    const last = t[t.length - 1];
+    // On the ground, keep just one point: the latest. It marks where the next
+    // takeoff starts (or where the last flight ended).
+    if (gnd && last[3] === "g") { t[t.length - 1] = pt; continue; }
+    if (last[0] < minute) t.push(pt);
   }
   const keepFrom = nowMin - TRACK_HOURS * 60;
   const fullFrom = nowMin - FULL_DETAIL_MIN;
   for (const [hex, t] of tracks) {
-    // Keep every point from the last 2 hours; thin older ones to one per 15 min.
+    // Keep every point from the last 2 hours; thin older ones to one per 15 min,
+    // but never drop a ground point or the first point after one (takeoff).
     const kept = [];
     for (const p of t) {
       if (p[0] < keepFrom) continue;
       const prev = kept[kept.length - 1];
-      if (p[0] < fullFrom && prev && p[0] - prev[0] < 15) continue;
+      if (p[0] < fullFrom && prev && p[0] - prev[0] < 15 && p[3] !== "g" && prev[3] !== "g") continue;
       kept.push(p);
     }
     if (!kept.length || kept[kept.length - 1][0] < nowMin - TRACK_DROP_MIN) tracks.delete(hex);
     else tracks.set(hex, kept);
   }
-  let out = `T ${keepFrom}`;
-  for (const [hex, t] of tracks) out += `\n${hex}|` + t.map((p) => `${p[0] - keepFrom},${p[1]},${p[2]}`).join(";");
-  return out;
+  const text = (entries) => {
+    let out = `T ${keepFrom}`;
+    for (const [hex, t] of entries) out += `\n${hex}|` + t.map((p) => `${p[0] - keepFrom},${p[1]},${p[2]},${p[3] ?? ""},${p[4] ?? ""}`).join(";");
+    return out;
+  };
+  if (!USE_R2) return { tracks: text(tracks) };
+  const shards = Object.fromEntries(SHARDS.map((c) => [c, []]));
+  for (const e of tracks) (shards[e[0].slice(-1)] || shards["0"]).push(e);
+  return Object.fromEntries(SHARDS.map((c) => [`tracks/${c}`, text(shards[c])]));
 }
 
 /* ---------- run ---------- */
@@ -286,11 +302,17 @@ try { fill = JSON.parse((await storeGet("fill")) || "null"); } catch (e) { conso
 const fillFresh = fill && Date.now() - fill.at < FILL_EVERY_MS;
 // A failed tracks read must never be mistaken for "no history": that used to
 // reset every plane's recorded path. Skip updating tracks this run instead.
-let oldTracks = null, tracksOk = true;
+let oldTracks = [], tracksOk = true;
+const readTracks = async () => {
+  if (!USE_R2) { oldTracks = [await storeGet("tracks")]; return; }
+  oldTracks = await Promise.all(SHARDS.map((c) => storeGet(`tracks/${c}`)));
+  // First run after switching to split files: carry over the single old file.
+  if (oldTracks.every((t) => t == null)) oldTracks = [await storeGet("tracks")];
+};
 const [os, fiNew] = await Promise.all([
   openSky().catch((e) => { console.error(`OpenSky failed: ${e.message}`); return null; }),
   fillFresh ? null : adsbFi(),
-  storeGet("tracks").then((t) => { oldTracks = t; }, (e) => { tracksOk = false; console.warn(`tracks read failed, keeping history as is: ${e.message}`); }),
+  readTracks().catch((e) => { tracksOk = false; console.warn(`tracks read failed, keeping history as is: ${e.message}`); }),
 ]);
 if (fiNew) {
   fill = { at: Date.now(), rows: fiNew };
@@ -316,15 +338,17 @@ const body = JSON.stringify({ fetched: Date.now(), time: os?.time || Math.floor(
 await storePut("snapshot", body);
 let tracksNote = "tracks skipped (read failed)";
 if (tracksOk) {
-  const prev = parseTracks(oldTracks);
-  const tracks = updateTracks(prev, ac, Math.floor(Date.now() / 60000));
-  if (!USE_R2 && tracks.length > 24 * 1024 * 1024) {
-    tracksNote = `tracks NOT saved: ${(tracks.length / 1048576).toFixed(1)} MB is over KV's 25 MB limit; switch to R2`;
+  const prev = new Map();
+  for (const t of oldTracks) parseTracks(t, prev);
+  const files = updateTracks(prev, ac, Math.floor(Date.now() / 60000));
+  const bytes = Object.values(files).reduce((n, t) => n + t.length, 0);
+  if (!USE_R2 && bytes > 24 * 1024 * 1024) {
+    tracksNote = `tracks NOT saved: ${(bytes / 1048576).toFixed(1)} MB is over KV's 25 MB limit; switch to R2`;
   } else {
-    await storePut("tracks", tracks);
+    await Promise.all(Object.entries(files).map(([k, t]) => storePut(k, t)));
     let pts = 0;
     for (const t of prev.values()) pts += t.length;
-    tracksNote = `tracks ${(tracks.length / 1024).toFixed(0)} KB, ${prev.size} aircraft, ${pts} points`;
+    tracksNote = `tracks ${(bytes / 1024).toFixed(0)} KB in ${Object.keys(files).length} file(s), ${prev.size} aircraft, ${pts} points`;
   }
 }
 console.log(

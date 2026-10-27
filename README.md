@@ -4,19 +4,19 @@ Live global map of commercial flights.
 
 ```
 index.html                              the app
-functions/api/states.js                 serves the latest global snapshot from KV
+functions/api/states.js                 serves the latest global snapshot from R2 (or KV)
 functions/api/lookup.js                 aircraft details and fallback routes (adsbdb), cached 6 hours
-functions/api/track.js                  up to 20 hours of positions for one aircraft, from KV
+functions/api/track.js                  up to 20 hours of positions, altitude and speed for one aircraft
 functions/api/flight.js                 FlightAware schedule, times and gates (optional, needs AEROAPI_KEY)
 functions/api/config.js                 public settings for the page (CARTO_KEY)
 functions/api/live.js                   relay for the zoomed in live feed when the browser can't reach it
 airlines.json                           airline names and codes (OpenFlights), for logos
-scheduler/                              Cloudflare Worker that starts the snapshot job every 5 minutes
+scheduler/                              Cloudflare Worker that starts the snapshot job every 2 minutes
 airports.json                           airport names and coordinates (OurAirports), loaded on first click
 navaids.json                            radio navigation aid coordinates (OurAirports), for reading filed routes
 favicon.svg, apple-touch-icon.png       site icons
 .github/workflows/opensky-snapshot.yml  the snapshot job (started by the scheduler)
-.github/scripts/snapshot.mjs            fetches OpenSky + adsb.fi, writes snapshot and track history to KV
+.github/scripts/snapshot.mjs            fetches OpenSky + adsb.fi, writes the snapshot and track history (16 files in R2)
 ```
 
 OpenSky doesn't answer Cloudflare's servers and doesn't allow browser requests from other sites, so a scheduled GitHub Action fetches it and stores the result in Cloudflare R2 (or Workers KV). The site reads from there. A separate live feed (adsb.lol, airplanes.live) updates every 5 seconds straight from the browser when you zoom in, and always follows the selected plane.
@@ -58,4 +58,6 @@ OpenSky doesn't answer Cloudflare's servers and doesn't allow browser requests f
 * Airline logos load from pics.avs.io, falling back to images.kiwi.com.
 * AeroAPI's Personal tier is for personal or academic use only.
 * Data sources are free for non commercial use. Check each provider's terms before using it inside a business product.
-* URLs are shareable: `#zoom/lat/lon/hex` restores the view and selected plane.
+* URLs are shareable: `#zoom/lat/lon/hex` restores the view and selected plane, and `#zoom/lat/lon/KSAN` opens an airport.
+* Airport view: click an airport on the map (large ones from zoom 4, others from zoom 7) or search its code. Arrivals, departures and planes on the ground are worked out from positions within 120 nm, confirmed by each airline's recent routes where known.
+* Track history records altitude and ground speed, plus one point on the ground before each takeoff, which gives the altitude chart and an exact takeoff time.

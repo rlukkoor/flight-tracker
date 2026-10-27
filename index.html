@@ -60,6 +60,29 @@ button.tog{font:inherit;font-size:12.5px}
 .ihead .cs .iata{font-size:14px;font-weight:600;color:var(--muted)}
 .ihead .logo{display:block;height:30px;max-width:150px;object-fit:contain;object-position:left;margin-bottom:8px;background:#fff;border-radius:6px;padding:3px 6px}
 .tm .late{color:var(--warn)}
+.profile{padding:8px 14px 6px}
+.profile:empty{display:none}
+.ptitle{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;display:flex;justify-content:space-between}
+.ptitle span{text-transform:none;letter-spacing:0;color:var(--text);font-weight:600}
+.pnote{font-size:12px;color:var(--muted);margin-top:2px}
+svg.prof{display:block;width:100%;height:104px;margin-top:4px;overflow:visible;touch-action:none}
+.prof .pg{stroke:var(--line);stroke-width:1;vector-effect:non-scaling-stroke}
+.prof .pl{fill:var(--muted);font-size:9px}
+.prof .pt{fill:var(--text);font-size:9.5px;font-weight:600;paint-order:stroke;stroke:var(--panel);stroke-width:3px}
+.prof .pa{fill:var(--accent);opacity:.14}
+.prof .pline{fill:none;stroke:var(--accent);stroke-width:1.8;vector-effect:non-scaling-stroke;stroke-linejoin:round}
+.prof .pdot{fill:var(--accent);stroke:var(--panel);stroke-width:1.5}
+.prof .ph{stroke:var(--muted);stroke-width:1;stroke-dasharray:2 3;vector-effect:non-scaling-stroke}
+.apsec{padding:10px 14px;border-bottom:1px solid var(--line)}
+.apt{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;display:flex;gap:6px;align-items:center;margin-bottom:4px}
+.apt span{background:var(--chip);border-radius:999px;padding:0 7px;color:var(--text);letter-spacing:0}
+.aprow{display:flex;align-items:baseline;gap:8px;width:100%;padding:6px 0;border:0;border-top:1px solid var(--line);background:none;color:var(--text);font:inherit;font-size:12.5px;text-align:left;cursor:pointer}
+.aprow:first-of-type{border-top:0}
+.aprow:hover b{color:var(--accent)}
+.aprow .w{color:var(--muted);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.aprow .r{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.apchips{display:flex;flex-wrap:wrap;gap:5px}
+.apchip{font:inherit;font-size:11.5px;padding:3px 7px;border-radius:7px;border:1px solid var(--line);background:var(--chip);color:var(--text);cursor:pointer}
 .trackmsg{font-size:12px;color:var(--muted);padding:0 14px 10px;margin-top:-2px}
 .trackmsg:empty{display:none}
 .trackmsg button{font:inherit;font-size:12px;color:var(--accent);background:none;border:1px solid var(--line);border-radius:7px;padding:4px 8px;cursor:pointer;margin-top:4px}
@@ -112,7 +135,7 @@ button.tog{font:inherit;font-size:12.5px}
   <div id="count">Loading aircraft</div>
   <div class="body">
     <form class="search" id="qform" role="search" autocomplete="off">
-      <div class="qrow"><input id="q" type="search" enterkeyhint="search" placeholder="Flight (UA189), callsign, hex or tail" autocomplete="off" spellcheck="false" aria-label="Find a flight"><button type="submit" class="qbtn">Find</button></div>
+      <div class="qrow"><input id="q" type="search" enterkeyhint="search" placeholder="Flight, airport or tail number" autocomplete="off" spellcheck="false" aria-label="Find a flight"><button type="submit" class="qbtn">Find</button></div>
       <div id="qmsg" class="qmsg" aria-live="polite"></div>
     </form>
     <div class="row">
@@ -162,7 +185,7 @@ const planes = new Map();         // hex -> plane
 let gid = 0;
 const gMeta = { ok: false, fetched: 0, ttl: 0, auth: false, err: "", stale: false, n: 0 };
 const rMeta = { active: false, ok: false, at: 0, src: "", err: "", backoff: 0, fails: 0, pref: 0 };
-const ui = { airlinesOnly: true, showGround: true, q: "", selected: null, dark: false };
+const ui = { airlinesOnly: true, showGround: true, q: "", selected: null, airport: null, dark: false };
 const lookups = new Map();
 
 /* ---------- helpers ---------- */
@@ -320,6 +343,8 @@ function draw() {
   const worldW = 256 * Math.pow(2, z);
   const nowS = Date.now() / 1000;
   const stroke = ui.dark ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.85)";
+  drawAirports(z, worldW);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.lineWidth = 1.1;
   ctx.strokeStyle = stroke;
   let sel = null, shown = 0;
@@ -369,6 +394,65 @@ map.on("moveend", () => { writeHash(); scheduleRegional(400); });
   setTimeout(tick, 100);
 })();
 
+/* ---------- airports on the map ----------
+   Large airports from zoom 4, all others with airline service codes from zoom 7. */
+let airportList = null, aptHit = [];
+function buildAirportList(d) {
+  const seen = new Set();
+  airportList = [];
+  for (const [icao, a] of Object.entries(d)) {
+    const k = a[4] + "," + a[5];
+    if (seen.has(k)) continue; // gps_code aliases point at the same airport
+    seen.add(k);
+    airportList.push({ icao, iata: a[0], name: a[1], city: a[2], country: a[3], lat: a[4], lon: a[5], big: a[6] === 1 });
+  }
+  airportList.sort((x, y) => y.big - x.big); // big ones win label space
+  queueDraw();
+}
+function airportByCode(code) {
+  if (!airportsData || !airportList) return null;
+  const c = code.toUpperCase();
+  if (c.length === 4 && airportsData[c]) return airportList.find((a) => a.icao === c) || null;
+  return airportList.find((a) => a.iata === c) || null;
+}
+function drawAirports(z, worldW) {
+  aptHit = [];
+  if (!airportList || z < 4) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const labels = z >= 7, fill = ui.dark ? "#0e1116" : "#ffffff", ink = ui.dark ? "rgba(200,208,220,.75)" : "rgba(70,80,95,.75)";
+  ctx.font = "600 10px ui-sans-serif,system-ui,sans-serif";
+  ctx.textBaseline = "middle";
+  const placed = []; // label boxes already drawn; big airports come first and win
+  const free = (x0, y0, x1, y1) => !placed.some((b) => x0 < b[2] && x1 > b[0] && y0 < b[3] && y1 > b[1]);
+  for (const a of airportList) {
+    const selected = a.icao === ui.airport;
+    if (!a.big && z < 7 && !selected) continue;
+    if (!a.big && !a.iata && !selected) continue;
+    const pt = map.latLngToContainerPoint([a.lat, a.lon]);
+    let x = pt.x, y = pt.y;
+    if (x < -20) x += worldW; else if (x > cw + 20) x -= worldW;
+    if (x < -20 || x > cw + 20 || y < -20 || y > ch + 20) continue;
+    const r = selected ? 5.5 : a.big ? 3.4 : 2.6;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = selected ? (ui.dark ? "#6ea0ff" : "#2563eb") : fill; ctx.fill();
+    ctx.lineWidth = selected ? 2 : 1.3; ctx.strokeStyle = selected ? fill : ink; ctx.stroke();
+    if ((labels && (a.big || z >= 8)) || selected) {
+      const t = a.iata || a.icao, w = ctx.measureText(t).width, lx = x + r + 3;
+      if (selected || free(lx - 1, y - 6, lx + w + 1, y + 6)) {
+        ctx.fillStyle = ink;
+        ctx.fillText(t, lx, y);
+        placed.push([lx - 1, y - 6, lx + w + 1, y + 6]);
+      }
+    }
+    aptHit.push([x, y, a]);
+  }
+}
+function hitAirport(cp, radius = 9) {
+  let best = null, bd = radius * radius;
+  for (const [x, y, a] of aptHit) { const d = (x - cp.x) ** 2 + (y - cp.y) ** 2; if (d < bd) { bd = d; best = a; } }
+  return best;
+}
+
 function hit(cp, radius = 12) {
   let best = null, bd = radius * radius;
   for (let i = 0; i < hitN; i++) {
@@ -385,19 +469,30 @@ map.on("mousemove", (e) => {
   if (!first) return;
   requestAnimationFrame(() => {
     const cp = hoverQueued; hoverQueued = null;
-    const p = hit(cp);
-    map.getContainer().style.cursor = p ? "pointer" : "";
-    if (!p) { tip.style.display = "none"; return; }
-    tip.innerHTML = `<b>${esc(p.cs || p.hex.toUpperCase())}</b>${p.type ? " &middot; " + esc(p.type) : ""}<br>${p.gnd ? "On ground" : (p.alt != null ? nf(p.alt) + " ft" : "Altitude n/a")}${p.gs != null ? " &middot; " + nf(p.gs) + " kt" : ""}`;
+    const { p, ap } = pick(cp, 12, 9);
+    map.getContainer().style.cursor = p || ap ? "pointer" : "";
+    if (!p && !ap) { tip.style.display = "none"; return; }
+    if (ap) tip.innerHTML = `<b>${esc(ap.iata || ap.icao)}</b> &middot; ${esc(ap.name)}`;
+    else tip.innerHTML = `<b>${esc(p.cs || p.hex.toUpperCase())}</b>${p.type ? " &middot; " + esc(p.type) : ""}<br>${p.gnd ? "On ground" : (p.alt != null ? nf(p.alt) + " ft" : "Altitude n/a")}${p.gs != null ? " &middot; " + nf(p.gs) + " kt" : ""}`;
     tip.style.display = "block";
     const x = Math.min(cp.x + 14, window.innerWidth - tip.offsetWidth - 8);
     tip.style.left = x + "px"; tip.style.top = cp.y + 14 + "px";
   });
 });
 map.on("mouseout", () => { tip.style.display = "none"; });
+// Parked planes sit right on top of airport markers. Unless zoomed in close
+// enough to tell them apart, a click there means the airport.
+function pick(cp, pr, ar) {
+  const p = hit(cp, pr), ap = hitAirport(cp, ar);
+  if (p && ap && p.gnd && map.getZoom() < 12) return { ap };
+  return p ? { p } : ap ? { ap } : {};
+}
 map.on("click", (e) => {
-  const p = hit(e.containerPoint, 16);
-  if (p) select(p.hex); else if (ui.selected) deselect();
+  const { p, ap } = pick(e.containerPoint, 16, 11);
+  if (p) { select(p.hex); return; }
+  if (ap) { selectAirport(ap.icao); return; }
+  if (ui.selected) deselect();
+  if (ui.airport) closeAirport();
 });
 
 /* ---------- data: global snapshot ----------
@@ -474,15 +569,17 @@ async function loadRegional() {
     const lng = shiftNear(plo, map.getCenter().lng);
     if (!zoomedIn || !map.getBounds().contains([pla, lng])) follow = { la: pla, lo: ((plo + 540) % 360) - 180 };
   }
+  const fa = !sel && ui.airport && airportList?.find((x) => x.icao === ui.airport);
+  if (fa && (!zoomedIn || !map.getBounds().contains([fa.lat, shiftNear(fa.lon, map.getCenter().lng)]))) follow = { la: fa.lat, lo: fa.lon, r: 100, name: fa.iata || fa.icao };
   if (!zoomedIn && !follow) {
     rMeta.active = false; rMeta.follow = null; updateStatus();
     return scheduleRegional(REGIONAL_EVERY);
   }
   rMeta.active = true;
-  rMeta.follow = follow ? sel.cs || sel.hex.toUpperCase() : null;
+  rMeta.follow = follow ? follow.name || sel.cs || sel.hex.toUpperCase() : null;
   if (Date.now() < rMeta.backoff) { updateStatus(); return scheduleRegional(rMeta.backoff - Date.now() + 50); }
   let la, lo, r;
-  if (follow) { la = follow.la.toFixed(3); lo = follow.lo.toFixed(3); r = 40; }
+  if (follow) { la = follow.la.toFixed(3); lo = follow.lo.toFixed(3); r = follow.r || 40; }
   else {
     const c = map.getCenter().wrap();
     const ne = map.getBounds().getNorthEast();
@@ -633,6 +730,9 @@ async function fetchTrack(hex) {
 function trimToFlight(p) {
   const h = p.hist;
   if (!h?.length) return;
+  // The snapshot job keeps one point on the ground before each takeoff, so the
+  // current flight starts at the last ground point.
+  for (let i = h.length - 1; i >= 0; i--) if (h[i][5] === 1) { if (i > 0) p.hist = h.slice(i); return; }
   const off = Date.parse(p.lk?.fa?.off?.act || "");
   if (!isNaN(off)) { p.hist = h.filter((q) => q[0] * 1000 >= off - 600e3); return; }
   const o = p.leg?.o;
@@ -768,7 +868,7 @@ async function loadFaTrack(p, asked) {
   const j = await m.p;
   if (ui.selected !== p.hex) return;
   if (!j?.points?.length) { if (j?.limited) { p.faTrackLimited = j.limited; renderStats(); } return; }
-  p.hist = mergeTracks(p.hist, j.points.map((q) => [q[0], q[1], q[2]]));
+  p.hist = mergeTracks(p.hist, j.points.map((q) => [q[0], q[1], q[2], q[3], q[4], 0]));
   trimToFlight(p);
   const last = j.points[j.points.length - 1];
   p.seenAt = last[0]; p.seenSrc = last[6];
@@ -842,6 +942,11 @@ function pushTrail(p) {
   const last = p.trail[p.trail.length - 1];
   if (!last || last[0] !== p.lat || last[1] !== p.lon) p.trail.push([p.lat, p.lon]);
   if (p.trail.length > 600) p.trail.shift();
+  // Altitude and speed seen live since selecting, for the altitude chart.
+  p.prof ||= [];
+  const lp = p.prof[p.prof.length - 1], t = Math.round(p.t || Date.now() / 1000);
+  if (!lp || t - lp[0] >= 5) p.prof.push([t, p.gnd ? 0 : p.alt, p.gs]);
+  if (p.prof.length > 2000) p.prof.shift();
   updateSelectionGraphics(p);
 }
 function unwrap(pts) {
@@ -915,6 +1020,7 @@ async function loadHistory(p) {
 function select(hex, fly) {
   const p = planes.get(hex);
   if (!p) return;
+  if (ui.airport) closeAirport(true);
   if (ui.selected && ui.selected !== hex) clearSelectionLayers();
   ui.selected = hex;
   p.trail = [[p.lat, p.lon]];
@@ -936,7 +1042,7 @@ function clearSelectionLayers() {
 }
 function deselect() {
   const p = planes.get(ui.selected);
-  if (p) { delete p.trail; delete p.hist; }
+  if (p) { delete p.trail; delete p.hist; delete p.prof; }
   ui.selected = null;
   clearSelectionLayers();
   info.classList.remove("open");
@@ -945,6 +1051,113 @@ function deselect() {
   writeHash();
 }
 map.on("moveend", () => updateSelectionGraphics(planes.get(ui.selected)));
+
+/* ---------- airport view ----------
+   Traffic around an airport right now, worked out from aircraft positions:
+   arriving (heading toward it, low or descending), departing (heading away,
+   low or climbing) and on the ground. Where a callsign's recent routes are
+   known, they confirm the airport and add where it's from or going. */
+let aptRing = null, aptRenderedAt = 0;
+const routeHints = new Map(); // callsign -> [{o, d}] (ICAO codes), or null while loading
+const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+function selectAirport(icao, fly) {
+  const a = airportList?.find((x) => x.icao === icao);
+  if (!a) return;
+  if (ui.selected) deselect();
+  ui.airport = icao;
+  if (aptRing) map.removeLayer(aptRing);
+  const col = ui.dark ? "#6ea0ff" : "#2563eb";
+  aptRing = L.circle([a.lat, a.lon], { radius: 120 * 1852, color: col, weight: 1, opacity: 0.5, dashArray: "4 6", fill: false, interactive: false }).addTo(map);
+  info.classList.add("open");
+  info.scrollTop = 0;
+  renderAirport();
+  queueDraw();
+  writeHash();
+  if (fly) map.flyTo([a.lat, a.lon], Math.max(map.getZoom(), 8), { duration: 0.8 });
+  scheduleRegional(200);
+}
+function closeAirport(keepPanel) {
+  ui.airport = null;
+  if (aptRing) { map.removeLayer(aptRing); aptRing = null; }
+  if (!keepPanel) { info.classList.remove("open"); info.innerHTML = ""; }
+  queueDraw();
+  writeHash();
+}
+function airportTraffic(a) {
+  const arr = [], dep = [], gnd = [], nowS = Date.now() / 1000;
+  for (const p of planes.values()) {
+    if (p.synthetic || !passes(p)) continue;
+    const [la, lo] = curPos(p, nowS);
+    const d = distNm(la, lo, a.lat, a.lon);
+    if (d > 200) continue;
+    if (p.gnd) { if (d < 4) gnd.push({ p, d }); continue; }
+    if (p.trk == null) continue;
+    const toward = d < 3 || angDiff(p.trk, bearing(la, lo, a.lat, a.lon)) < 45;
+    const away = angDiff(p.trk, bearing(a.lat, a.lon, la, lo)) < 45;
+    const low = p.alt != null && p.alt < 18000, vr = p.vr ?? 0;
+    if (toward && (low || vr < -300) && (d < 120 || vr < -300)) arr.push({ p, d, eta: p.gs > 60 ? (d / p.gs) * 60 : null });
+    else if (away && d < 120 && (low || vr > 300) && (d < 50 || vr > 300)) dep.push({ p, d });
+  }
+  arr.sort((x, y) => (x.eta ?? 999) - (y.eta ?? 999));
+  dep.sort((x, y) => x.d - y.d);
+  gnd.sort((x, y) => (x.p.cs || "").localeCompare(y.p.cs || ""));
+  return { arr, dep, gnd };
+}
+// Look up recent routes for listed callsigns (free, one file per airline), then redraw.
+let hintTimer = null;
+function wantHints(list) {
+  for (const { p } of list.slice(0, 40)) {
+    const cs = p.cs;
+    if (!cs || !isAirline(cs) || routeHints.has(cs)) continue;
+    routeHints.set(cs, null);
+    observedRoutes(cs).then((r) => {
+      routeHints.set(cs, r.map((x) => ({ o: x.o, d: x.d })));
+      clearTimeout(hintTimer);
+      hintTimer = setTimeout(() => { if (ui.airport) renderAirport(); }, 300);
+    }).catch(() => routeHints.set(cs, []));
+  }
+}
+const aptCode = (icao) => (airportsData?.[icao]?.[0]) || icao;
+function aptRow(p, side, text, here) {
+  const h = routeHints.get(p.cs);
+  let where = "";
+  if (h && h.length) {
+    const m = h.filter((x) => (side === "arr" ? x.d : x.o) === here);
+    if (!m.length) return ""; // its known routes don't use this airport: just passing by
+    const other = [...new Set(m.map((x) => aptCode(side === "arr" ? x.o : x.d)))].slice(0, 2).join("/");
+    where = `${side === "arr" ? "from" : "to"} ${esc(other)}`;
+  }
+  return `<button type="button" class="aprow" data-hex="${esc(p.hex)}"><b>${esc(p.cs || p.hex.toUpperCase())}</b><span class="w">${where}</span><span class="r">${text}</span></button>`;
+}
+function renderAirport() {
+  const a = airportList?.find((x) => x.icao === ui.airport);
+  if (!a) return;
+  aptRenderedAt = Date.now();
+  const { arr, dep, gnd } = airportTraffic(a);
+  wantHints([...arr, ...dep]);
+  const arrRows = arr.map(({ p, d, eta }) => aptRow(p, "arr", `${p.alt != null ? nf(p.alt) + " ft" : ""} &middot; ${nf(d)} nm${eta != null ? ` &middot; ~${Math.max(1, Math.round(eta))} min` : ""}`, a.icao)).filter(Boolean);
+  const depRows = dep.map(({ p, d }) => aptRow(p, "dep", `${p.alt != null ? nf(p.alt) + " ft" : ""} &middot; ${nf(d)} nm out`, a.icao)).filter(Boolean);
+  const chips = gnd.map(({ p }) => `<button type="button" class="apchip" data-hex="${esc(p.hex)}">${esc(p.cs || p.hex.toUpperCase())}</button>`).join("");
+  const section = (title, n, body, empty) => `<div class="apsec"><div class="apt">${title}<span>${n}</span></div>${n ? body : `<div class="pnote">${empty}</div>`}</div>`;
+  const scroll = info.scrollTop;
+  info.innerHTML = `
+    <div class="ihead">
+      <button class="close" id="xclose" aria-label="Close">&times;</button>
+      <div class="cs">${esc(a.iata || a.icao)} <span class="iata">${esc(a.icao)}</span></div>
+      <div class="al">${esc(a.name)}</div>
+      <div class="al">${esc([a.city, a.country].filter(Boolean).join(", "))}</div>
+    </div>
+    ${section("Arriving", arrRows.length, arrRows.join(""), "No arrivals in sight right now.")}
+    ${section("Departing", depRows.length, depRows.join(""), "No departures in sight right now.")}
+    ${section("On the ground", gnd.length, `<div class="apchips">${chips}</div>`, "No aircraft on the ground reported. Many airports have no receiver close enough to see the ground.")}
+    <div class="ifoot">Worked out from aircraft positions within 120 nm right now${ui.airlinesOnly ? ", airlines only" : ""}. Where an airline's recent routes are known, they confirm the airport; flights whose routes don't use ${esc(a.iata || a.icao)} are left out.</div>`;
+  info.scrollTop = scroll;
+  $("#xclose").onclick = () => closeAirport();
+}
+info.addEventListener("click", (e) => {
+  const b = e.target.closest?.("[data-hex]");
+  if (b && planes.has(b.dataset.hex)) select(b.dataset.hex, true);
+});
 
 /* ---------- routes ----------
    Primary: overhead-routes, rebuilt nightly from flights adsb.lol actually
@@ -1143,8 +1356,13 @@ function legTimes(p, leg) {
     while (t < Date.now() - 18 * 3600e3) t += 86400e3;
     out.typical = t;
   }
-  const f = p.hist?.[0];
-  if (f && distNm(f[1], f[2], leg.o.lat, leg.o.lon) < 60 && Date.now() / 1000 - f[0] < 19.8 * 3600) out.tookOff = f[0] * 1000;
+  const h = p.hist || [];
+  const gi = h.findIndex((q) => q[5] === 1);
+  if (gi >= 0 && h[gi + 1]) out.tookOff = h[gi + 1][0] * 1000; // first airborne point after the ground point
+  else {
+    const f = h[0];
+    if (f && distNm(f[1], f[2], leg.o.lat, leg.o.lon) < 60 && Date.now() / 1000 - f[0] < 19.8 * 3600) out.tookOff = f[0] * 1000;
+  }
   if (!p.gnd && p.gs > 100) {
     const [la, lo] = curPos(p, Date.now() / 1000);
     out.eta = Date.now() + (distNm(la, lo, leg.d.lat, leg.d.lon) / p.gs) * 3600e3;
@@ -1262,12 +1480,85 @@ function renderInfo(p) {
     </div>
     ${photo ? `<img class="photo" src="${esc(photo)}" alt="Photo of ${esc(lk?.aircraft?.reg || "aircraft")}" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ""}
     ${route}
+    <div class="profile" id="profile"></div>
     <div class="trackmsg" id="trackmsg"></div>
     <div class="grid" id="stats"></div>
     <div class="ifoot" id="foot"></div>`;
   $("#xclose").onclick = deselect;
   renderStats();
 }
+/* ---------- altitude profile ----------
+   Altitude over time for the selected flight, from the snapshot job's
+   recordings, FlightAware's track when loaded, and live updates. */
+function profileData(p) {
+  const pts = [];
+  for (const q of p.hist || []) if (q[3] != null) pts.push([q[0], q[3], q[4] ?? null]);
+  for (const q of p.prof || []) if (q[1] != null) pts.push(q);
+  // The current reading, on a 15 second step so the chart isn't redrawn every second.
+  if (!p.synthetic && p.alt != null) pts.push([Math.floor(Date.now() / 15000) * 15, p.gnd ? 0 : Math.round(p.alt / 100) * 100, p.gs != null ? Math.round(p.gs) : null]);
+  pts.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const q of pts) { const l = out[out.length - 1]; if (!l || q[0] - l[0] >= 15) out.push(q); else if (q === pts[pts.length - 1]) out[out.length - 1] = q; }
+  return out;
+}
+const PW = 312, PH = 104, PL = 34, PR = 8, PT = 8, PB = 18;
+function renderProfile(p) {
+  const el = $("#profile");
+  if (!el) return;
+  const d = profileData(p);
+  const key = d.length + ":" + (d[d.length - 1]?.join(",") || "");
+  if (el.dataset.key === key) return;
+  el.dataset.key = key;
+  if (d.length < 3 || d[d.length - 1][0] - d[0][0] < 300) {
+    el.innerHTML = p.synthetic ? "" : `<div class="ptitle">Altitude</div><div class="pnote">The altitude chart fills in as positions are recorded.</div>`;
+    return;
+  }
+  const t0 = d[0][0], t1 = d[d.length - 1][0];
+  const maxAlt = Math.max(10000, Math.ceil(Math.max(...d.map((q) => q[1])) / 10000) * 10000);
+  const X = (t) => PL + ((t - t0) / Math.max(1, t1 - t0)) * (PW - PL - PR);
+  const Y = (a) => PT + (1 - a / maxAlt) * (PH - PT - PB);
+  let line = "", area = "", segStart = null;
+  for (let i = 0; i < d.length; i++) {
+    const [t, a] = d[i];
+    const gap = i > 0 && t - d[i - 1][0] > 25 * 60; // no data for a while: break the line
+    if (i === 0 || gap) {
+      if (segStart != null) area += `L${X(d[i - 1][0]).toFixed(1)},${Y(0)}L${X(segStart).toFixed(1)},${Y(0)}Z`;
+      line += `M${X(t).toFixed(1)},${Y(a).toFixed(1)}`; area += `M${X(t).toFixed(1)},${Y(a).toFixed(1)}`; segStart = t;
+    } else { line += `L${X(t).toFixed(1)},${Y(a).toFixed(1)}`; area += `L${X(t).toFixed(1)},${Y(a).toFixed(1)}`; }
+  }
+  area += `L${X(t1).toFixed(1)},${Y(0)}L${X(segStart).toFixed(1)},${Y(0)}Z`;
+  let grid = "";
+  for (let a = 0; a <= maxAlt; a += maxAlt > 30000 ? 10000 : 5000) {
+    grid += `<line x1="${PL}" x2="${PW - PR}" y1="${Y(a)}" y2="${Y(a)}" class="pg"/><text x="${PL - 4}" y="${Y(a) + 3}" class="pl" text-anchor="end">${a ? a / 1000 + "k" : "0"}</text>`;
+  }
+  const last = d[d.length - 1];
+  el.innerHTML = `<div class="ptitle">Altitude<span>${last[1] ? nf(last[1]) + " ft" : "On ground"}${last[2] ? " &middot; " + nf(last[2]) + " kt" : ""}</span></div>
+    <svg class="prof" viewBox="0 0 ${PW} ${PH}" preserveAspectRatio="none" role="img" aria-label="Altitude over the flight">
+      ${grid}
+      <path d="${area}" class="pa"/><path d="${line}" class="pline"/>
+      <circle cx="${X(last[0])}" cy="${Y(last[1])}" r="3" class="pdot"/>
+      <text x="${PL}" y="${PH - 4}" class="pl">${fmtTime(t0 * 1000)}</text>
+      <text x="${PW - PR}" y="${PH - 4}" class="pl" text-anchor="end">Now</text>
+      <g id="phover"></g>
+    </svg>`;
+  el._d = d; el._x = X; el._y = Y; el._t = [t0, t1];
+}
+// Hover on the chart: show the altitude and speed at that moment.
+document.addEventListener("pointermove", (e) => {
+  const svg = e.target.closest?.("svg.prof");
+  const el = $("#profile");
+  if (!el?._d) return;
+  const g = el.querySelector("#phover");
+  if (!svg) { if (g?.innerHTML) g.innerHTML = ""; return; }
+  const r = svg.getBoundingClientRect(), vx = ((e.clientX - r.left) / r.width) * PW;
+  const [t0, t1] = el._t, t = t0 + ((vx - PL) / (PW - PL - PR)) * (t1 - t0);
+  let best = el._d[0];
+  for (const q of el._d) if (Math.abs(q[0] - t) < Math.abs(best[0] - t)) best = q;
+  const x = el._x(best[0]), y = el._y(best[1]), right = x > PW * 0.6;
+  g.innerHTML = `<line x1="${x}" x2="${x}" y1="${PT}" y2="${PH - PB}" class="ph"/><circle cx="${x}" cy="${y}" r="3" class="pdot"/>
+    <text x="${right ? x - 5 : x + 5}" y="${PT + 9}" class="pt" text-anchor="${right ? "end" : "start"}">${best[1] ? nf(best[1]) + " ft" : "Ground"}${best[2] ? ", " + nf(best[2]) + " kt" : ""}, ${fmtTime(best[0] * 1000)}</text>`;
+});
+
 // Say when the recorded path doesn't reach back to takeoff, and offer FlightAware's track.
 function renderTrackMsg(p) {
   const el = $("#trackmsg");
@@ -1331,6 +1622,7 @@ function renderStats() {
     if (ta) ta.innerHTML = arrHtml(p, legTimes(p, p.leg));
   }
   renderTrackMsg(p);
+  renderProfile(p);
   updateSelectionGraphics(p);
 }
 
@@ -1351,7 +1643,7 @@ function updateStatus() {
   if (!rMeta.active) s.textContent = "Zoom in or select a plane for live updates every 5 seconds";
   else if (rMeta.ok && Date.now() - rMeta.at < 20000) {
     const selp = planes.get(ui.selected);
-    const seen = selp && selp.liveSeen && Date.now() - selp.liveSeen < 20000;
+    const seen = ui.airport || (selp && selp.liveSeen && Date.now() - selp.liveSeen < 20000);
     s.innerHTML = rMeta.follow
       ? `<b>Live</b> following ${esc(rMeta.follow)} via ${esc(rMeta.src)}, ${seen ? ago(Date.now() - rMeta.at) : "not in receiver range right now"}`
       : `<b>Live</b> ${esc(rMeta.src)}, ${nf(rMeta.count || 0)} aircraft nearby, ${ago(Date.now() - rMeta.at)}`;
@@ -1361,7 +1653,11 @@ function updateStatus() {
   const live = (gMeta.ok && !gMeta.stale) || (rMeta.active && rMeta.ok);
   $("#liveDot").classList.toggle("off", !live);
 }
-setInterval(() => { updateStatus(); if (ui.selected) renderStats(); }, 1000);
+setInterval(() => {
+  updateStatus();
+  if (ui.selected) renderStats();
+  else if (ui.airport && Date.now() - aptRenderedAt > 5000) renderAirport();
+}, 1000);
 
 /* ---------- search and filters ---------- */
 const q = $("#q");
@@ -1390,6 +1686,12 @@ $("#qform").addEventListener("submit", async (e) => {
   queueDraw();
   if (!ui.q) return;
   const Q = ui.q, Ql = Q.toLowerCase(), alt = ui.qAlt;
+  const ap = /^[A-Z]{3,4}$/.test(Q) ? airportByCode(Q) : null;
+  if (ap) {
+    let exact = false;
+    for (const p of planes.values()) if (p.cs === Q) { exact = true; break; }
+    if (!exact) { $("#qmsg").innerHTML = ""; selectAirport(ap.icao, true); q.blur(); return; }
+  }
   let best = null;
   for (const p of planes.values()) {
     if (p.cs === Q || (alt && p.cs === alt) || p.hex === Ql || (p.reg && p.reg.replace(/-/g, "") === Q.replace(/-/g, ""))) { best = p; break; }
@@ -1421,19 +1723,30 @@ $("#theme").addEventListener("click", () => {
   if (p?.lk) drawRoute(p);
 });
 $("#collapse").addEventListener("click", () => { const t = $("#top"); t.classList.toggle("min"); $("#collapse").innerHTML = t.classList.contains("min") ? "&#9652;" : "&#9662;"; });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && ui.selected && document.activeElement !== q) deselect(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || document.activeElement === q) return;
+  if (ui.selected) deselect(); else if (ui.airport) closeAirport();
+});
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { loadGlobal(); scheduleRegional(100); } });
 
 /* ---------- shareable URL: #zoom/lat/lon[/hex] ---------- */
 function parseHash() {
-  const m = location.hash.match(/^#(\d{1,2})\/(-?[\d.]+)\/(-?[\d.]+)(?:\/([0-9a-f]{6}))?/i);
-  return m ? { z: +m[1], lat: +m[2], lon: +m[3], hex: m[4] && m[4].toLowerCase() } : null;
+  const m = location.hash.match(/^#(\d{1,2})\/(-?[\d.]+)\/(-?[\d.]+)(?:\/([0-9a-f]{6}|[A-Z0-9]{4}))?/i);
+  if (!m) return null;
+  const x = m[4] || "";
+  const isHex = /^[0-9a-f]{6}$/i.test(x);
+  return { z: +m[1], lat: +m[2], lon: +m[3], hex: isHex ? x.toLowerCase() : null, apt: !isHex && x ? x.toUpperCase() : null };
 }
 function writeHash() {
   const c = map.getCenter().wrap();
-  const h = `#${map.getZoom()}/${c.lat.toFixed(3)}/${c.lng.toFixed(3)}${ui.selected ? "/" + ui.selected : ""}`;
+  const h = `#${map.getZoom()}/${c.lat.toFixed(3)}/${c.lng.toFixed(3)}${ui.selected ? "/" + ui.selected : ui.airport ? "/" + ui.airport : ""}`;
   if (h !== location.hash) history.replaceState(null, "", h);
 }
+// Airports load at startup: the map draws them, and a shared link may open one.
+loadAirports().then((d) => {
+  buildAirportList(d);
+  if (hash?.apt) selectAirport(hash.apt);
+});
 let pendingHex = hash?.hex || null;
 const waitForHex = setInterval(() => {
   if (!pendingHex) return clearInterval(waitForHex);
