@@ -239,6 +239,10 @@ const lookups = new Map();
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const nf = (n) => Math.round(n).toLocaleString();
+// For searching: lowercase, without accents or special letters, so
+// "Aeroméxico" = "aeromexico", "Zürich" = "zurich", "Łódź" = "lodz".
+const FOLD = { "ø": "o", "æ": "ae", "œ": "oe", "ß": "ss", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "ı": "i", "ħ": "h" };
+const fold = (s) => String(s || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[øæœßłđðþıħ]/g, (c) => FOLD[c]);
 const rad = (d) => (d * Math.PI) / 180, deg = (r) => (r * 180) / Math.PI;
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
@@ -359,10 +363,35 @@ function toCallsign(q) {
   const icao = m && airlinesByIata?.[m[1]];
   return icao && !/^[A-Z]{3}\d/.test(q) ? icao + m[2] : null;
 }
-function matchesQuery(p) {
+function prefixMatch(p) {
   const q = ui.q;
   if (ui.qAlt && p.cs && p.cs.startsWith(ui.qAlt)) return true;
   return (p.cs && p.cs.startsWith(q)) || p.hex.startsWith(q.toLowerCase()) || (p.reg && p.reg.replace(/-/g, "").startsWith(q.replace(/-/g, "")));
+}
+function matchesQuery(p) {
+  if (prefixMatch(p)) return true;
+  return !!(ui.qAirlines && p.cs && ui.qAirlines.has(p.cs.slice(0, 3)));
+}
+// Airlines whose name contains the search, ignoring accents (4+ letters).
+function airlinesNamed(raw) {
+  const f = fold(raw).trim();
+  if (f.length < 4 || !/[a-z]/.test(f) || !airlinesData) return null;
+  const out = new Set();
+  for (const [icao, [, name]] of Object.entries(airlinesData)) if (fold(name).includes(f)) out.add(icao);
+  return out.size ? out : null;
+}
+// Airports by name or city, ignoring accents. Big airports first; an exact city match wins.
+function airportsNamed(raw) {
+  const f = fold(raw).trim();
+  if (f.length < 3 || !airportList) return [];
+  const hits = [];
+  for (const a of airportList) {
+    const city = fold(a.city), name = fold(a.name);
+    if (city === f) hits.push([a, 0]);
+    else if (city.startsWith(f) || name.includes(f)) hits.push([a, 1]);
+  }
+  hits.sort((x, y) => x[1] - y[1] || y[0].big - x[0].big);
+  return hits.map((h) => h[0]);
 }
 function passes(p) {
   if (p.hex === ui.selected) return true;
@@ -1223,6 +1252,10 @@ function renderAirport() {
   info.scrollTop = scroll;
   $("#xclose").onclick = () => closeAirport();
 }
+$("#qmsg").addEventListener("click", (e) => {
+  const a = e.target.closest?.("[data-apt]");
+  if (a) { e.preventDefault(); selectAirport(a.dataset.apt, true); }
+});
 info.addEventListener("click", (e) => {
   const b = e.target.closest?.("[data-hex]");
   if (b && planes.has(b.dataset.hex)) select(b.dataset.hex, true);
@@ -1357,25 +1390,28 @@ function bearing(la1, lo1, la2, lo2) {
   return (deg(Math.atan2(y, x)) + 360) % 360;
 }
 // Does the plane plausibly sit on the leg o -> d? Returns its cross track distance, or null.
+// Could the plane be on the leg o -> d? Planes often fly well away from the
+// shortest path (around closed airspace, along oceanic tracks or polar routes),
+// so the test is generous: the detour via the plane's position must be under
+// about 45% of the leg, and the plane mustn't be heading away from the
+// destination. Returns the detour in nm (smaller fits better), or null.
 function legFit(p, o, d) {
   const len = distNm(o.lat, o.lon, d.lat, d.lon);
   if (len < 5) return null;
   const fromO = distNm(o.lat, o.lon, p.lat, p.lon), toD = distNm(p.lat, p.lon, d.lat, d.lon);
   const near = fromO < 40 || toD < 40;
   if (p.gnd) return near ? 0 : null;
-  const d13 = fromO / R_NM, dth = rad(bearing(o.lat, o.lon, p.lat, p.lon) - bearing(o.lat, o.lon, d.lat, d.lon));
-  const xt = Math.asin(Math.sin(d13) * Math.sin(dth)) * R_NM;
-  const at = Math.acos(Math.max(-1, Math.min(1, Math.cos(d13) / Math.cos(xt / R_NM)))) * R_NM * (Math.cos(dth) < 0 ? -1 : 1);
-  if (Math.abs(xt) > Math.max(100, 0.2 * len)) return null;
-  if (at < -50 || at > len + 50) return null;
-  if (!near && p.trk != null) {
-    const diff = Math.abs(((p.trk - bearing(p.lat, p.lon, d.lat, d.lon)) % 360 + 540) % 360 - 180);
-    if (diff > 90) return null;
-  }
-  return Math.abs(xt);
+  const detour = fromO + toD - len;
+  if (detour > len * 0.45 + 150) return null;
+  if (!near && p.trk != null && angDiff(p.trk, bearing(p.lat, p.lon, d.lat, d.lon)) > 100) return null;
+  return detour;
 }
 function chooseLeg(p) {
   const c = p.lk?.cands || [];
+  // FlightAware's record is of this very flight today, so it isn't second-guessed
+  // while the flight is in progress (or the plane is on the ground at either end).
+  const fa = p.lk?.fa, faLeg = c.find((l) => l.src === "fa");
+  if (faLeg && ((fa.off?.act && !fa.on?.act) || (p.gnd && legFit(p, faLeg.o, faLeg.d) != null))) return { ...faLeg, score: 3e6 };
   let best = null;
   for (const leg of c) {
     const xt = legFit(p, leg.o, leg.d);
@@ -1532,7 +1568,7 @@ function renderInfo(p) {
   } else {
     const c = lk.cands[0], io = inferOrigin(p);
     const why = c
-      ? `This callsign usually flies ${apLabel(c.o)} to ${apLabel(c.d)}, but that doesn't fit where the plane is or where it's heading, so it's likely on a different route today.`
+      ? `This callsign usually flies ${apLabel(c.o)} to ${apLabel(c.d)}, but the plane is far off that route or heading away from ${apLabel(c.d)}, so it may be on a different route today.${p.lk?.faStatus === "on" ? "" : " FlightAware would have the exact route."}`
       : "No route on file for this callsign.";
     route = io
       ? `<div class="route">
@@ -1735,8 +1771,10 @@ const q = $("#q");
 q.addEventListener("input", () => {
   ui.q = q.value.trim().toUpperCase().replace(/\s+/g, "");
   ui.qAlt = toCallsign(ui.q);
+  ui.qAirlines = airlinesNamed(q.value); // typing an airline name shows its planes
   $("#qmsg").innerHTML = "";
   queueDraw();
+  setTimeout(updateStatus, 80);
   const id = ui.qAlt || ui.q;
   if (id.length >= 4 && isAirline(id)) {
     let any = false;
@@ -1746,7 +1784,7 @@ q.addEventListener("input", () => {
 });
 loadAirlines();
 q.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { q.value = ""; ui.q = ""; ui.qAlt = null; $("#qmsg").innerHTML = ""; queueDraw(); q.blur(); }
+  if (e.key === "Escape") { q.value = ""; ui.q = ""; ui.qAlt = null; ui.qAirlines = null; $("#qmsg").innerHTML = ""; queueDraw(); q.blur(); }
 });
 // Enter, the Find button, and a phone keyboard's Go key all submit the form.
 $("#qform").addEventListener("submit", async (e) => {
@@ -1754,9 +1792,12 @@ $("#qform").addEventListener("submit", async (e) => {
   // Read the box directly, in case no input event fired (autofill, paste, some keyboards).
   ui.q = q.value.trim().toUpperCase().replace(/\s+/g, "");
   ui.qAlt = toCallsign(ui.q);
+  ui.qAirlines = airlinesNamed(q.value);
   queueDraw();
+  setTimeout(updateStatus, 80);
   if (!ui.q) return;
   const Q = ui.q, Ql = Q.toLowerCase(), alt = ui.qAlt;
+  const raw = q.value.trim();
   const ap = /^[A-Z]{3,4}$/.test(Q) ? airportByCode(Q) : null;
   if (ap) {
     let exact = false;
@@ -1767,9 +1808,24 @@ $("#qform").addEventListener("submit", async (e) => {
   for (const p of planes.values()) {
     if (p.cs === Q || (alt && p.cs === alt) || p.hex === Ql || (p.reg && p.reg.replace(/-/g, "") === Q.replace(/-/g, ""))) { best = p; break; }
     // A partial match (UAL18 finding UAL1891) only counts when the search isn't a full flight number.
-    if (!best && !isAirline(alt || Q) && matchesQuery(p)) best = p;
+    if (!best && !isAirline(alt || Q) && prefixMatch(p)) best = p;
   }
   if (best) { select(best.hex, true); q.blur(); return; }
+  // Names: an airport by city or name, or an airline (accents don't matter).
+  if (/[^\d\s-]/.test(raw) && fold(raw).length >= 3 && !isAirline(alt || Q)) {
+    const aps = airportsNamed(raw), city = aps[0] && fold(aps[0].city) === fold(raw);
+    if (city || (aps.length && !ui.qAirlines)) {
+      $("#qmsg").innerHTML = aps.slice(1).some((a) => a.iata) ? `Also: ${aps.slice(1).filter((a) => a.iata).slice(0, 3).map((a) => `<a href="#" data-apt="${esc(a.icao)}">${esc(a.iata || a.icao)} ${esc(a.name)}</a>`).join(", ")}` : "";
+      selectAirport(aps[0].icao, true); q.blur(); return;
+    }
+    if (ui.qAirlines) {
+      let n = 0;
+      for (const p of planes.values()) if (matchesQuery(p)) n++;
+      const names = [...ui.qAirlines].map((c) => airlinesData[c][1]);
+      $("#qmsg").innerHTML = `Showing ${nf(n)} ${esc(names.length === 1 ? names[0] : names.slice(0, 3).join(", ") + (names.length > 3 ? "…" : ""))} flight${n === 1 ? "" : "s"} on the map. Press Escape to show all.`;
+      return;
+    }
+  }
   const id = alt || Q;
   const link = `<a href="https://www.flightaware.com/live/flight/${encodeURIComponent(id)}" target="_blank" rel="noopener">Check FlightAware</a>`;
   if (!isAirline(id)) { $("#qmsg").innerHTML = `${esc(id)} isn't on the map right now. ${link}`; return; }
@@ -1799,14 +1855,14 @@ function parseAirline(v) {
   const t = v.split(/[\s·]+/)[0].toUpperCase();
   if (/^[A-Z]{3}$/.test(t) && (!airlinesData || airlinesData[t])) return t;
   if (/^[A-Z0-9]{2}$/.test(t) && airlinesByIata?.[t]) return airlinesByIata[t];
-  const low = v.toLowerCase();
+  const low = fold(v);
   if (airlinesData) {
     // Prefer an airline that's actually flying right now.
     const counts = new Map();
     for (const p of planes.values()) if (isAirline(p.cs)) counts.set(p.cs.slice(0, 3), (counts.get(p.cs.slice(0, 3)) || 0) + 1);
     let best = null, bc = -1;
     for (const [icao, [, name]] of Object.entries(airlinesData)) {
-      if (!name.toLowerCase().includes(low)) continue;
+      if (!fold(name).includes(low)) continue;
       const c = counts.get(icao) || 0;
       if (c > bc) { bc = c; best = icao; }
     }
@@ -1870,7 +1926,11 @@ function refreshFilterLists() {
     if (p.type) ty.set(p.type.toUpperCase(), (ty.get(p.type.toUpperCase()) || 0) + 1);
   }
   $("#airlineList").innerHTML = [...al].sort((a, b) => b[1] - a[1]).slice(0, 250)
-    .map(([k, n]) => `<option value="${esc(k)}${airlinesData?.[k] ? " · " + esc(airlinesData[k][1]) : ""}">${nf(n)} on the map</option>`).join("");
+    .map(([k, n]) => {
+      const name = airlinesData?.[k]?.[1] || "", plain = fold(name);
+      const alias = name && plain !== name.toLowerCase() ? ` (${esc(plain)})` : "";
+      return `<option value="${esc(k)}${name ? " · " + esc(name) : ""}">${nf(n)} on the map${alias}</option>`;
+    }).join("");
   $("#typeList").innerHTML = [...ty].sort((a, b) => b[1] - a[1]).slice(0, 200)
     .map(([k, n]) => `<option value="${esc(k)}">${nf(n)} on the map</option>`).join("");
 }
