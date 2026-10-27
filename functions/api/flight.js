@@ -63,7 +63,8 @@ async function reserve(context, units) {
 }
 
 // GET /api/flight?track=<fa_flight_id>: FlightAware's recorded positions for one
-// flight, including satellite (space-based ADS-B) positions over oceans.
+// flight. Satellite (space-based ADS-B) positions only appear on AeroAPI's Premium tier;
+// Personal returns ground receiver positions plus oceanic reports where available.
 async function track(context, faId) {
   const { request, env } = context;
   let cache = null, key = null;
@@ -142,6 +143,7 @@ export async function onRequestGet(context) {
     // AeroAPI gives filed altitude in hundreds of feet (350 = 35,000 ft)
     filedAlt: f.filed_altitude ? (f.filed_altitude < 1000 ? f.filed_altitude * 100 : f.filed_altitude) : null,
     filedSpeed: f.filed_airspeed || null, progress: f.progress_percent ?? null,
+    route: f.route || null, // filed route, e.g. "ENI J589 40N140W 39N150W ..."
   };
   const res = json({ enabled: true, flight: flight || null, trackUnits: Number(env.AEROAPI_TRACK_UNITS) || 3 }, 900);
   if (cache) context.waitUntil(cache.put(key, res.clone()).catch(() => {}));

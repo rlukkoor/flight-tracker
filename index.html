@@ -630,14 +630,99 @@ function trimToFlight(p) {
 /* ---------- schedule-based positions ----------
    Over oceans there are no ground receivers. Like FlightAware, place the plane
    along the shortest route by how far through its scheduled flight time it is. */
+/* ---------- filed routes ----------
+   FlightAware's lookup includes the route the crew filed with air traffic
+   control. Over oceans it's mostly plain coordinates (40N150W), plus radio
+   navigation aids by name. Those become the path the estimate follows, instead
+   of the shortest-distance arc. Named five-letter waypoints have no free
+   coordinate source, so they're skipped. */
+let navaidsP = null;
+function loadNavaids() {
+  return (navaidsP ||= fetch("navaids.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})));
+}
+// ARINC 424 short forms used on oceanic tracks: 4050N = 40N 50W, 40N50 = 40N 150W.
+function arinc(lat, lon, q) {
+  return [q === "S" || q === "W" ? -lat : lat, q === "E" || q === "S" ? lon : -lon];
+}
+function parseCoord(t) {
+  let m = /^(\d{2})(\d{2})?([NS])(\d{3})(\d{2})?([EW])$/.exec(t);
+  if (m) {
+    const lat = (+m[1] + (m[2] ? +m[2] / 60 : 0)) * (m[3] === "S" ? -1 : 1);
+    const lon = (+m[4] + (m[5] ? +m[5] / 60 : 0)) * (m[6] === "W" ? -1 : 1);
+    return Math.abs(lat) <= 90 && Math.abs(lon) <= 180 ? [lat, lon] : null;
+  }
+  if ((m = /^(\d{2})(\d{2})([NESW])$/.exec(t))) return arinc(+m[1], +m[2], m[3]);
+  if ((m = /^(\d{2})([NESW])(\d{2})$/.exec(t))) return arinc(+m[1], 100 + +m[3], m[2]);
+  return null;
+}
+// Resolve a filed route into coordinates between the origin and destination.
+async function filedRoutePts(fa, o, d) {
+  if (!fa?.route || !o || !d) return [];
+  if (fa.routePts) return fa.routePts;
+  const nav = await loadNavaids();
+  const direct = distNm(o.lat, o.lon, d.lat, d.lon);
+  const inCorridor = (q) => distNm(o.lat, o.lon, q[0], q[1]) + distNm(q[0], q[1], d.lat, d.lon) <= direct * 1.3 + 300;
+  const out = [];
+  let prev = [o.lat, o.lon];
+  for (const raw of fa.route.toUpperCase().split(/\s+/)) {
+    const t = raw.split("/")[0];
+    if (!t || t === "DCT") continue;
+    let q = parseCoord(t);
+    if (!q && /^[A-Z]{2,3}$/.test(t) && nav[t]) {
+      // Several beacons can share a name; take the one nearest the route so far.
+      let best = null, bd = Infinity;
+      for (const c of nav[t]) { const dd = distNm(prev[0], prev[1], c[0], c[1]) + distNm(c[0], c[1], d.lat, d.lon); if (dd < bd) { bd = dd; best = c; } }
+      q = best;
+    }
+    if (q && inCorridor(q)) { out.push(q); prev = q; }
+  }
+  return (fa.routePts = out);
+}
+// Filed waypoints still ahead of a given position.
+function routeAhead(p, from, d) {
+  const pts = p.lk?.fa?.routePts || p.filedPts;
+  if (!pts?.length) return [];
+  const left = distNm(from.lat, from.lon, d.lat, d.lon);
+  return pts.filter((q) => distNm(q[0], q[1], d.lat, d.lon) < left - 20);
+}
+// A dense path through waypoints, with cumulative distance for timing.
+function buildPath(way) {
+  const pts = [], cum = [];
+  for (let i = 0; i < way.length - 1; i++) {
+    const len = distNm(way[i][0], way[i][1], way[i + 1][0], way[i + 1][1]);
+    let seg = greatCircle(way[i], way[i + 1], Math.max(4, Math.min(64, Math.round(len / 40))));
+    if (pts.length) { const k = Math.round((pts[pts.length - 1][1] - seg[0][1]) / 360) * 360; seg = seg.slice(1).map(([a, b]) => [a, b + k]); }
+    for (const q of seg) {
+      const l = pts[pts.length - 1];
+      cum.push(l ? cum[cum.length - 1] + distNm(l[0], l[1], q[0], q[1]) : 0);
+      pts.push(q);
+    }
+  }
+  return { pts, cum, total: cum[cum.length - 1] || 0 };
+}
 function setFaPath(p, o, d, offMs, onMs) {
-  p.faPath = { pts: greatCircle([o.lat, o.lon], [d.lat, d.lon], 256), off: offMs, on: onMs };
+  const ahead = routeAhead(p, o, d);
+  const path = buildPath([[o.lat, o.lon], ...ahead, [d.lat, d.lon]]);
+  p.faPath = { ...path, off: offMs, on: onMs, filed: ahead.length > 0 };
+}
+// The estimated path from its start up to the plane's current estimated position.
+function faPathSoFar(p, nowMs) {
+  const fp = p.faPath, f = Math.min(1, Math.max(0, (nowMs - fp.off) / Math.max(1, fp.on - fp.off)));
+  const target = f * fp.total, out = [];
+  for (let i = 0; i < fp.pts.length && fp.cum[i] < target; i++) out.push(fp.pts[i]);
+  const [la, lo] = faPos(p, nowMs);
+  const last = out[out.length - 1] || fp.pts[0];
+  out.push([la, lo + Math.round((last[1] - lo) / 360) * 360]);
+  return out;
 }
 function faPos(p, nowMs) {
   const fp = p.faPath, n = fp.pts.length - 1;
   const f = Math.min(1, Math.max(0, (nowMs - fp.off) / Math.max(1, fp.on - fp.off)));
-  const x = f * n, i = Math.min(n - 1, Math.floor(x)), t = x - i;
-  const a = fp.pts[i], b = fp.pts[i + 1];
+  const target = f * fp.total;
+  let lo = 0, hi = n;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (fp.cum[mid] <= target) lo = mid; else hi = mid; }
+  const i = Math.min(lo, n - 1), a = fp.pts[i], b = fp.pts[i + 1];
+  const t = (target - fp.cum[i]) / Math.max(1e-9, fp.cum[i + 1] - fp.cum[i]);
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, bearing(a[0], a[1], b[0], b[1])];
 }
 function faTimes(fa) {
@@ -651,8 +736,8 @@ function tryFaPath(p) {
   setFaPath(p, { lat: p.lat, lon: p.lon }, leg.d, Math.max(t.off, (p.t || 0) * 1000), t.on);
   return true;
 }
-// FlightAware's recorded track for an out-of-range flight: real positions,
-// including satellite ones over oceans. Fetched only for planes whose current
+// FlightAware's recorded track for an out-of-range flight: real positions from
+// its receivers and oceanic reports (satellite positions need AeroAPI Premium). Fetched only for planes whose current
 // position is estimated, since it costs more than a lookup.
 const faTrackMemo = new Map();
 async function loadFaTrack(p, asked) {
@@ -722,6 +807,7 @@ async function findViaFlightAware(id) {
   let p = planes.get(key);
   if (!p) { p = { hex: key, synthetic: true, cs: id, est: true, gnd: false, alt: null, vr: null }; planes.set(key, p); }
   Object.assign(p, { realHex, reg: f.registration || null, type: f.aircraftType || null, altFiled: f.filedAlt, spdFiled: f.filedSpeed });
+  p.filedPts = await filedRoutePts(f, { lat: o[4], lon: o[5] }, { lat: d[4], lon: d[5] });
   p.hist = realHex ? await fetchTrack(realHex) : [];
   const O = { lat: o[4], lon: o[5] }, D = { lat: d[4], lon: d[5] };
   faPathFromHistory(p, O, D, t);
@@ -779,8 +865,9 @@ function updateSelectionGraphics(p) {
     trailLine.setLatLngs(solid.length > 1 ? solid : []);
     if (estLine) {
       if (p.faPath) {
-        const s0 = all[all.length - 2], gc = greatCircle(s0, here, 48), g = here[1] - gc[gc.length - 1][1];
-        estLine.setLatLngs(gc.map(([a, b]) => [a, b + g]));
+        // The estimated stretch follows the same path the plane is moved along.
+        const sofar = faPathSoFar(p, Date.now()), g = here[1] - sofar[sofar.length - 1][1];
+        estLine.setLatLngs(sofar.map(([a, b]) => [a, b + g]));
       } else estLine.setLatLngs([]);
     }
     if (gapLine) {
@@ -792,9 +879,10 @@ function updateSelectionGraphics(p) {
     }
   }
   if (remainLine && p.leg) {
-    const gc = greatCircle(here, [p.leg.d.lat, p.leg.d.lon], 64);
-    const k = here[1] - gc[0][1];
-    remainLine.setLatLngs(gc.map(([a, b]) => [a, b + k]));
+    const d = p.leg.d;
+    const { pts } = buildPath([here, ...routeAhead(p, { lat: la, lon: lo }, d), [d.lat, d.lon]]);
+    const k = here[1] - pts[0][1];
+    remainLine.setLatLngs(pts.map(([a, b]) => [a, b + k]));
   }
 }
 async function loadHistory(p) {
@@ -928,6 +1016,10 @@ async function fetchLookup(p) {
   const out = normalize(raw);
   out.fa = faRes?.flight || null;
   out.faTrackUnits = faRes?.trackUnits || 3;
+  if (out.fa?.origin?.icao && out.fa?.destination?.icao) {
+    const a = apts[out.fa.origin.icao], b = apts[out.fa.destination.icao];
+    if (a && b) await filedRoutePts(out.fa, { lat: a[4], lon: a[5] }, { lat: b[4], lon: b[5] });
+  }
   out.faStatus = faRes ? (faRes.limited ? "limited" : faRes.enabled ? "on" : "off") : "off";
   out.faLimit = faRes?.limited || null;
   const al = als[(cs || "").slice(0, 3)];
@@ -1202,7 +1294,7 @@ function renderStats() {
   const age = p.t ? Date.now() / 1000 - p.t : null;
   const owner = ac?.owner ? `Operated by ${esc(ac.owner)}. ` : "";
   const estNote = p.faPath
-    ? `<span class="late">Estimated position. ${p.seenAt ? `FlightAware's last position report was ${fmtDur(Date.now() - p.seenAt * 1000)} ago${p.seenSrc === "S" ? ", from a satellite receiver" : ""}.` : "No receiver is in range, which is normal over open ocean."} From there the plane is placed along the shortest route to ${esc(p.leg?.d?.iata || "its destination")}, timed to FlightAware's arrival estimate. The solid line is its real recorded path; the dotted line is estimated.${p.faTrackLimited ? ` FlightAware's ${p.faTrackLimited === "month" ? "monthly" : "daily"} limit was reached, so its recorded track couldn't be loaded.` : ""}</span><br>`
+    ? `<span class="late">Estimated position. ${p.seenAt ? `FlightAware's last position report was ${fmtDur(Date.now() - p.seenAt * 1000)} ago${p.seenSrc === "S" ? ", from a satellite receiver" : ""}.` : "No receiver is in range, which is normal over open ocean."} From there the plane is placed along ${p.faPath.filed ? "its filed route" : "the shortest route"} to ${esc(p.leg?.d?.iata || "its destination")}, timed to FlightAware's arrival estimate. The solid line is its real recorded path; the dotted line is estimated.${p.faTrackLimited ? ` FlightAware's ${p.faTrackLimited === "month" ? "monthly" : "daily"} limit was reached, so its recorded track couldn't be loaded.` : ""}</span><br>`
     : p.est ? `<span class="late">Estimated position. No receiver has picked this plane up for ${fmtDur(Date.now() - p.t * 1000)}, usually because it's out of range over water or remote land.</span><br>` : "";
   const from = p.faPath ? "" : `Position from ${p.src === "live" ? esc(rMeta.src || "live feed") : "OpenSky"}${age != null ? ", " + ago(age * 1000) : ""}.`;
   const links = [
