@@ -464,16 +464,31 @@ function scheduleRegional(ms) { clearTimeout(regionalTimer); regionalTimer = set
 async function loadRegional() {
   if (regionalBusy) return scheduleRegional(1000);
   if (document.hidden) return scheduleRegional(REGIONAL_EVERY);
-  if (map.getZoom() < REGIONAL_MIN_ZOOM) {
-    rMeta.active = false; updateStatus();
+  // Follow the selected plane at any zoom: when zoomed out, or when it's off
+  // screen, ask for live positions around the plane instead of the view.
+  const sel = planes.get(ui.selected);
+  const zoomedIn = map.getZoom() >= REGIONAL_MIN_ZOOM;
+  let follow = null;
+  if (sel && !sel.synthetic) {
+    const [pla, plo] = curPos(sel, Date.now() / 1000);
+    const lng = shiftNear(plo, map.getCenter().lng);
+    if (!zoomedIn || !map.getBounds().contains([pla, lng])) follow = { la: pla, lo: ((plo + 540) % 360) - 180 };
+  }
+  if (!zoomedIn && !follow) {
+    rMeta.active = false; rMeta.follow = null; updateStatus();
     return scheduleRegional(REGIONAL_EVERY);
   }
   rMeta.active = true;
+  rMeta.follow = follow ? sel.cs || sel.hex.toUpperCase() : null;
   if (Date.now() < rMeta.backoff) { updateStatus(); return scheduleRegional(rMeta.backoff - Date.now() + 50); }
-  const c = map.getCenter().wrap();
-  const ne = map.getBounds().getNorthEast();
-  const r = Math.max(10, Math.min(250, Math.ceil(distNm(c.lat, c.lng, ne.lat, ne.lng))));
-  const la = c.lat.toFixed(3), lo = c.lng.toFixed(3);
+  let la, lo, r;
+  if (follow) { la = follow.la.toFixed(3); lo = follow.lo.toFixed(3); r = 40; }
+  else {
+    const c = map.getCenter().wrap();
+    const ne = map.getBounds().getNorthEast();
+    r = Math.max(10, Math.min(250, Math.ceil(distNm(c.lat, c.lng, ne.lat, ne.lng))));
+    la = c.lat.toFixed(3); lo = c.lng.toFixed(3);
+  }
   regionalBusy = true;
   let done = false, limited = false;
   for (let k = 0; k < REGIONAL.length && !done; k++) {
@@ -911,6 +926,7 @@ function select(hex, fly) {
   queueDraw();
   writeHash();
   if (fly) map.flyTo([p.lat, p.lon], Math.max(map.getZoom(), 7), { duration: 0.8 });
+  scheduleRegional(200); // start following it right away
   loadHistory(p);
   fetchLookup(p).then((L_) => { if (ui.selected === hex) { p.lk = L_; trimToFlight(p); renderInfo(p); drawRoute(p); loadFaTrack(p); } });
 }
@@ -1332,8 +1348,14 @@ function updateStatus() {
     g.innerHTML = `<span class="err"><b>Global</b> feed unavailable (${esc(gMeta.err || "connecting")}). Zoom in to use the live regional feed.</span>`;
   }
   const s = $("#sLive");
-  if (!rMeta.active) s.textContent = "Zoom in for live updates every 5 seconds";
-  else if (rMeta.ok && Date.now() - rMeta.at < 20000) s.innerHTML = `<b>Live</b> ${esc(rMeta.src)}, ${nf(rMeta.count || 0)} aircraft nearby, ${ago(Date.now() - rMeta.at)}`;
+  if (!rMeta.active) s.textContent = "Zoom in or select a plane for live updates every 5 seconds";
+  else if (rMeta.ok && Date.now() - rMeta.at < 20000) {
+    const selp = planes.get(ui.selected);
+    const seen = selp && selp.liveSeen && Date.now() - selp.liveSeen < 20000;
+    s.innerHTML = rMeta.follow
+      ? `<b>Live</b> following ${esc(rMeta.follow)} via ${esc(rMeta.src)}, ${seen ? ago(Date.now() - rMeta.at) : "not in receiver range right now"}`
+      : `<b>Live</b> ${esc(rMeta.src)}, ${nf(rMeta.count || 0)} aircraft nearby, ${ago(Date.now() - rMeta.at)}`;
+  }
   else if (Date.now() < rMeta.backoff) s.innerHTML = `<span class="err"><b>Live</b> feed ${esc(rMeta.err)}, retrying in ${Math.ceil((rMeta.backoff - Date.now()) / 1000)}s</span>`;
   else s.innerHTML = `<b>Live</b> connecting`;
   const live = (gMeta.ok && !gMeta.stale) || (rMeta.active && rMeta.ok);

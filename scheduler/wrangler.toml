@@ -3,7 +3,7 @@ main = "worker.js"
 compatibility_date = "2026-10-01"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/2 * * * *"] # every 2 minutes; use "*/5 * * * *" if you stay on KV storage
 
 [vars]
 GITHUB_REPO = "rlukkoor/flight-tracker"

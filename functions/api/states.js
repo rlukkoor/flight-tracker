@@ -117,14 +117,18 @@ function json(obj, status = 200, extra = {}) {
   });
 }
 
-// KV mode: a scheduled GitHub Action writes the snapshot into the FLIGHTS_KV
-// binding (OpenSky doesn't answer Cloudflare's servers directly).
+// Stored mode: a scheduled GitHub Action writes the snapshot to R2 (FLIGHTS_R2
+// binding) or Workers KV (FLIGHTS_KV), since OpenSky doesn't answer Cloudflare's
+// servers directly. R2 is preferred: it allows a refresh every 2 minutes.
 let kvBody = null;
 let kvAt = 0;
 async function fromKV(env) {
-  const every = Number(env.SNAPSHOT_EVERY) || 300;
-  if (!kvBody || Date.now() - kvAt > 30_000) {
-    const txt = await env.FLIGHTS_KV.get("snapshot", { cacheTtl: 60 });
+  const r2 = !!env.FLIGHTS_R2;
+  const every = Number(env.SNAPSHOT_EVERY) || (r2 ? 120 : 300);
+  if (!kvBody || Date.now() - kvAt > (r2 ? 15_000 : 30_000)) {
+    const txt = r2
+      ? await env.FLIGHTS_R2.get("snapshot").then((o) => (o ? o.text() : null))
+      : await env.FLIGHTS_KV.get("snapshot", { cacheTtl: 60 });
     if (txt) {
       kvBody = txt;
       kvAt = Date.now();
@@ -134,7 +138,7 @@ async function fromKV(env) {
   const fetched = Number((kvBody.slice(0, 40).match(/"fetched":(\d+)/) || [])[1] || 0);
   const lateMin = Math.round((Date.now() - fetched) / 60000);
   const stale = Date.now() - fetched > every * 3000;
-  return new Response(`{"ttl":${every},"auth":true,"source":"kv",${kvBody.slice(1)}`, {
+  return new Response(`{"ttl":${every},"auth":true,"source":"stored",${kvBody.slice(1)}`, {
     headers: {
       "content-type": "application/json",
       "cache-control": "no-store",
@@ -146,7 +150,7 @@ async function fromKV(env) {
 
 export async function onRequestGet(context) {
   const { request, env } = context;
-  if (env.FLIGHTS_KV) return fromKV(env);
+  if (env.FLIGHTS_R2 || env.FLIGHTS_KV) return fromKV(env);
   const auth = !!(env.OPENSKY_CLIENT_ID && env.OPENSKY_CLIENT_SECRET);
   const ttl = Number(env.OPENSKY_TTL) || (auth ? 90 : 900);
   const now = Date.now();

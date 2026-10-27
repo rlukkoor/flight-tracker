@@ -1,4 +1,4 @@
-// Cloudflare Pages Function: GET /api/config.js
+// Cloudflare Pages Function: GET /api/config  (the route has no .js; Pages drops the file extension)
 // Hands the page its public settings, so they live in the Pages project's
 // environment variables instead of being pasted into index.html.
 //

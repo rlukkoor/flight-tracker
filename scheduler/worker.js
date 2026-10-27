@@ -1,5 +1,5 @@
 // Flight tracker scheduler: a Cloudflare Worker with a cron trigger that starts
-// the GitHub snapshot workflow every 5 minutes. GitHub's own scheduler is
+// the GitHub snapshot workflow (every 2 minutes, set in wrangler.toml). GitHub's own scheduler is
 // best effort and often runs late or skips runs; Cloudflare's cron is punctual.
 //
 // Deploy from this folder:  npx wrangler deploy
@@ -30,7 +30,7 @@ export default {
   },
   // Visiting the worker's URL just reports that it's alive; it never triggers a run.
   async fetch() {
-    return new Response("Flight tracker scheduler: starts the snapshot job every 5 minutes.\n", {
+    return new Response("Flight tracker scheduler: starts the snapshot job on a schedule.\n", {
       headers: { "content-type": "text/plain" },
     });
   },
