@@ -46,7 +46,38 @@ h1 .live.off{background:var(--muted);animation:none}
 .tog{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:var(--chip);border:1px solid var(--line);
   cursor:pointer;user-select:none;font-size:12.5px;color:var(--text)}
 .tog input{margin:0;accent-color:var(--accent)}
+.tog.on{border-color:var(--accent);color:var(--accent)}
 button.tog{font:inherit;font-size:12.5px}
+.filters{margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--chip);display:grid;gap:9px}
+.filters[hidden]{display:none}
+.fl{display:grid;gap:4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.fl > span{float:right}
+.fl input[type=text],.fl input:not([type]){font:inherit;font-size:13px;text-transform:none;letter-spacing:0;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);outline:none}
+.fl input:focus{border-color:var(--accent)}
+#altLbl{text-transform:none;letter-spacing:0;color:var(--text);font-weight:600;margin-left:6px}
+.dual{position:relative;height:22px}
+.dual::before{content:"";position:absolute;left:0;right:0;top:10px;height:3px;border-radius:2px;background:var(--line)}
+.dual i{position:absolute;top:10px;height:3px;border-radius:2px;background:var(--accent)}
+.dual input{position:absolute;left:0;top:3px;width:100%;margin:0;pointer-events:none;-webkit-appearance:none;appearance:none;background:none;height:16px}
+.dual input::-webkit-slider-thumb{pointer-events:auto;-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);border:2px solid var(--panel);cursor:pointer}
+.dual input::-moz-range-thumb{pointer-events:auto;width:12px;height:12px;border-radius:50%;background:var(--accent);border:2px solid var(--panel);cursor:pointer}
+.dual input::-moz-range-track{background:none}
+.seg{display:flex;gap:6px;text-transform:none;letter-spacing:0}
+.seg label{display:flex;align-items:center;gap:5px;font-size:12.5px;color:var(--text);padding:4px 9px;border:1px solid var(--line);border-radius:999px;background:var(--panel);cursor:pointer}
+.seg input{margin:0;accent-color:var(--accent)}
+.fnote{font-size:11.5px;color:var(--muted)}
+.fnote:empty{display:none}
+#freset{justify-self:start}
+.legend.air{flex-wrap:wrap;gap:4px 10px}
+.legend.air .k{display:inline-flex;align-items:center;gap:4px;color:var(--text)}
+.legend.air .k i{width:9px;height:9px;border-radius:50%;display:inline-block}
+.meter{margin-top:2px}
+.meter:empty{display:none}
+.mrow{display:flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
+.mbar{flex:1;height:4px;border-radius:2px;background:var(--line);overflow:hidden;min-width:40px}
+.mbar i{display:block;height:100%;background:var(--good)}
+.mbar.warn i{background:var(--warn)}
+.mbar.full i{background:var(--bad)}
 .status{margin-top:10px;font-size:12px;color:var(--muted);display:grid;gap:3px}
 .status b{color:var(--text);font-weight:600}
 .status .err{color:var(--warn)}
@@ -142,11 +173,27 @@ svg.prof{display:block;width:100%;height:104px;margin-top:4px;overflow:visible;t
       <label class="tog"><input type="checkbox" id="fAir" checked> Airlines only</label>
       <label class="tog"><input type="checkbox" id="fGnd" checked> On ground</label>
       <button class="tog" id="theme" type="button">Dark map</button>
+      <button class="tog" id="fbtn" type="button" aria-expanded="false" aria-controls="filters">Filters</button>
     </div>
-    <div class="legend"><span>Gnd</span><span class="bar" id="lbar"></span><span>45k ft</span></div>
+    <div id="filters" class="filters" hidden>
+      <label class="fl">Airline<input id="fAirline" list="airlineList" placeholder="Any airline: name or code" autocomplete="off" spellcheck="false"></label>
+      <datalist id="airlineList"></datalist>
+      <label class="fl">Aircraft type<input id="fType" list="typeList" placeholder="Any type, e.g. B738, or A35 for all A350s" autocomplete="off" spellcheck="false"></label>
+      <datalist id="typeList"></datalist>
+      <div class="fl">Altitude <span id="altLbl">Any</span>
+        <div class="dual"><i id="altFill"></i><input type="range" id="altMin" min="0" max="45000" step="1000" value="0" aria-label="Lowest altitude"><input type="range" id="altMax" min="0" max="45000" step="1000" value="45000" aria-label="Highest altitude"></div>
+      </div>
+      <div class="fl">Color planes by
+        <div class="seg"><label><input type="radio" name="colorBy" value="alt" checked> Altitude</label><label><input type="radio" name="colorBy" value="airline"> Airline</label></div>
+      </div>
+      <div class="fnote" id="fnote"></div>
+      <button type="button" class="tog" id="freset">Reset filters</button>
+    </div>
+    <div class="legend" id="legend"><span>Gnd</span><span class="bar" id="lbar"></span><span>45k ft</span></div>
     <div class="status">
       <div id="sGlobal">Global feed: connecting</div>
       <div id="sLive">Zoom in for live updates every 5 seconds</div>
+      <div id="sMeter" class="meter"></div>
     </div>
   </div>
 </div>
@@ -252,7 +299,8 @@ function altColor(p) {
   if (p.alt == null) return COLORS[0];
   return COLORS[Math.min(COLORS.length - 1, Math.max(0, Math.round(p.alt / 500)))];
 }
-$("#lbar").style.background = `linear-gradient(90deg,${GROUND} 0 6%,${STOPS.map((s, i) => `rgb(${s[1]}) ${6 + (s[0] / 45000) * 94}%`).join(",")})`;
+const LEGEND_BG = `linear-gradient(90deg,${GROUND} 0 6%,${STOPS.map((s, i) => `rgb(${s[1]}) ${6 + (s[0] / 45000) * 94}%`).join(",")})`;
+$("#lbar").style.background = LEGEND_BG;
 
 /* ---------- map ---------- */
 const hash = parseHash();
@@ -319,9 +367,25 @@ function matchesQuery(p) {
 function passes(p) {
   if (p.hex === ui.selected) return true;
   if (!ui.showGround && p.gnd) return false;
-  if (ui.q) return matchesQuery(p);
+  if (ui.q) return matchesQuery(p); // a search shows its matches whatever the filters
   if (ui.airlinesOnly && !isAirline(p.cs)) return false;
+  if (ui.fAirline && !(p.cs || "").startsWith(ui.fAirline)) return false;
+  if (ui.fType && !(p.type || "").toUpperCase().startsWith(ui.fType)) return false;
+  if (ui.altMin > 0 || ui.altMax < 45000) {
+    const a = p.gnd ? 0 : p.alt;
+    if (a == null || a < ui.altMin) return false;
+    if (ui.altMax < 45000 && a > ui.altMax) return false;
+  }
   return true;
+}
+// Color by airline: a stable color per airline code.
+const PALETTE = ["#e8590c", "#1c7ed6", "#2b8a3e", "#c2255c", "#7048e8", "#e67700", "#0c8599", "#5c940d", "#d6336c", "#364fc7", "#a61e4d", "#087f5b"];
+function airlineColor(p) {
+  if (p.gnd) return GROUND;
+  if (!isAirline(p.cs)) return GROUND;
+  let h = 0;
+  for (const c of p.cs.slice(0, 3)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length];
 }
 function draw() {
   drawQueued = false;
@@ -344,6 +408,7 @@ function draw() {
   const nowS = Date.now() / 1000;
   const stroke = ui.dark ? "rgba(0,0,0,.55)" : "rgba(255,255,255,.85)";
   drawAirports(z, worldW);
+  const inView = new Map(); // airline code -> planes drawn, for the airline color key
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.lineWidth = 1.1;
   ctx.strokeStyle = stroke;
@@ -360,8 +425,9 @@ function draw() {
     if (p.hex === ui.selected) { sel = { p, x, y }; continue; }
     const a = rad(p.trk || 0), c = Math.cos(a) * s, sn = Math.sin(a) * s;
     ctx.setTransform(c, sn, -sn, c, x * dpr, y * dpr);
-    ctx.fillStyle = altColor(p);
+    ctx.fillStyle = ui.colorBy === "airline" ? airlineColor(p) : altColor(p);
     ctx.globalAlpha = p.est ? 0.35 : 1;
+    if (ui.colorBy === "airline" && isAirline(p.cs)) { const k = p.cs.slice(0, 3); inView.set(k, (inView.get(k) || 0) + 1); }
     ctx.fill(PLANE);
     if (z >= 4) ctx.stroke(PLANE);
     hitX[hitN] = x; hitY[hitN] = y; hitP[hitN++] = p;
@@ -381,6 +447,7 @@ function draw() {
   }
   lastDraw = Date.now();
   ui.shown = shown;
+  if (ui.colorBy === "airline") updateAirlineKey(inView);
 }
 function queueDraw() { if (!drawQueued) { drawQueued = true; requestAnimationFrame(draw); } }
 map.on("move resize", queueDraw);
@@ -527,6 +594,7 @@ async function loadGlobal() {
   globalTimer = setTimeout(loadGlobal, next);
 }
 function ingestGlobal(d) {
+  setTimeout(refreshFilterLists, 500);
   gid++;
   for (const a of d.ac) {
     const [hex, cs, country, lon, lat, altM, gnd, vel, trk, vr, tpos, sq, type, reg] = a;
@@ -862,7 +930,8 @@ async function loadFaTrack(p, asked) {
   let m = faTrackMemo.get(id);
   if (!m || Date.now() - m.at > 600e3) {
     m = { at: Date.now(), p: fetch(`${API_FLIGHT}?track=${encodeURIComponent(id)}`)
-      .then((r) => ((r.headers.get("content-type") || "").includes("json") ? r.json() : null)).catch(() => null) };
+      .then((r) => ((r.headers.get("content-type") || "").includes("json") ? r.json() : null))
+      .then((j) => { noteUsage(j); return j; }).catch(() => null) };
     faTrackMemo.set(id, m);
   }
   const j = await m.p;
@@ -1168,7 +1237,7 @@ info.addEventListener("click", (e) => {
 const ROUTES_CDN = "https://cdn.jsdelivr.net/gh/GumDropSoftware/overhead-routes";
 let airportsP = null, routesBaseP = null, routesCaution = null;
 const airlineRoutes = new Map();
-let airlinesP = null, airportsData = null, airlinesByIata = null;
+let airlinesP = null, airportsData = null, airlinesByIata = null, airlinesData = null;
 // FlightAware answers, remembered for 15 minutes so a search and a click share one lookup.
 const faMemo = new Map();
 function getFlightAware(cs) {
@@ -1176,12 +1245,14 @@ function getFlightAware(cs) {
   if (hit && Date.now() - hit.at < 900e3) return hit.p;
   const p = fetch(`${API_FLIGHT}?cs=${encodeURIComponent(cs)}`)
     .then((r) => ((r.headers.get("content-type") || "").includes("json") ? r.json() : null))
+    .then((j) => { noteUsage(j); return j; })
     .catch(() => null);
   faMemo.set(cs, { at: Date.now(), p });
   return p;
 }
 function loadAirlines() {
   return (airlinesP ||= fetch("airlines.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({})).then((d) => {
+    airlinesData = d;
     airlinesByIata = {};
     for (const [icao, [iata]] of Object.entries(d)) if (iata && !airlinesByIata[iata]) airlinesByIata[iata] = icao;
     // The main carrier wins where codes were reused.
@@ -1715,6 +1786,166 @@ $("#qform").addEventListener("submit", async (e) => {
 });
 $("#fAir").addEventListener("change", (e) => { ui.airlinesOnly = e.target.checked; queueDraw(); });
 $("#fGnd").addEventListener("change", (e) => { ui.showGround = e.target.checked; queueDraw(); });
+
+/* ---------- filters ----------
+   Airline, aircraft type and altitude, plus coloring by airline. Saved in this
+   browser so they're still set next time. */
+Object.assign(ui, { fAirline: "", fType: "", altMin: 0, altMax: 45000, colorBy: "alt" });
+const fEls = { airline: $("#fAirline"), type: $("#fType"), min: $("#altMin"), max: $("#altMax") };
+// "UAL", "UA", "United", or a picked suggestion like "UAL · United Airlines" -> "UAL"
+function parseAirline(v) {
+  v = (v || "").trim();
+  if (!v) return "";
+  const t = v.split(/[\s·]+/)[0].toUpperCase();
+  if (/^[A-Z]{3}$/.test(t) && (!airlinesData || airlinesData[t])) return t;
+  if (/^[A-Z0-9]{2}$/.test(t) && airlinesByIata?.[t]) return airlinesByIata[t];
+  const low = v.toLowerCase();
+  if (airlinesData) {
+    // Prefer an airline that's actually flying right now.
+    const counts = new Map();
+    for (const p of planes.values()) if (isAirline(p.cs)) counts.set(p.cs.slice(0, 3), (counts.get(p.cs.slice(0, 3)) || 0) + 1);
+    let best = null, bc = -1;
+    for (const [icao, [, name]] of Object.entries(airlinesData)) {
+      if (!name.toLowerCase().includes(low)) continue;
+      const c = counts.get(icao) || 0;
+      if (c > bc) { bc = c; best = icao; }
+    }
+    if (best) return best;
+  }
+  return /^[A-Z]{3}$/.test(t) ? t : "";
+}
+const altText = (a) => (a >= 1000 ? `${a / 1000}k` : String(a));
+function applyFilters(save = true) {
+  ui.fAirline = parseAirline(fEls.airline.value);
+  ui.fType = fEls.type.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4);
+  let lo = +fEls.min.value, hi = +fEls.max.value;
+  if (lo > hi) [lo, hi] = [hi, lo];
+  ui.altMin = lo; ui.altMax = hi;
+  $("#altLbl").textContent = lo === 0 && hi === 45000 ? "Any" : `${altText(lo)} to ${hi === 45000 ? "45k+" : altText(hi)} ft`;
+  const fill = $("#altFill");
+  fill.style.left = (lo / 45000) * 100 + "%"; fill.style.width = ((hi - lo) / 45000) * 100 + "%";
+  const n = (ui.fAirline ? 1 : 0) + (ui.fType ? 1 : 0) + (lo > 0 || hi < 45000 ? 1 : 0);
+  $("#fbtn").textContent = n ? `Filters (${n})` : "Filters";
+  $("#fbtn").classList.toggle("on", n > 0);
+  // Explain what the filters can and can't see.
+  const notes = [];
+  if (ui.fAirline) {
+    const name = airlinesData?.[ui.fAirline]?.[1];
+    notes.push(name ? `Airline: ${esc(name)} (${ui.fAirline}).` : `Airline code ${ui.fAirline}.`);
+  } else if (fEls.airline.value.trim()) notes.push("No airline matches that name.");
+  if (ui.fType) {
+    let known = 0, all = 0;
+    for (const p of planes.values()) { all++; if (p.type) known++; }
+    notes.push(`Aircraft type is known for ${nf(known)} of ${nf(all)} aircraft (it comes from adsb.fi and the live feed, not OpenSky), so this shows only those.`);
+  }
+  $("#fnote").innerHTML = notes.join(" ");
+  if (save) store.set("ft-filters", JSON.stringify({ a: fEls.airline.value, t: fEls.type.value, lo, hi, c: ui.colorBy }));
+  updateLegend();
+  queueDraw();
+  setTimeout(updateStatus, 80); // refresh "Showing X of Y" right after the redraw
+  if (ui.airport) renderAirport();
+}
+for (const el of [fEls.airline, fEls.type]) el.addEventListener("input", () => applyFilters());
+for (const el of [fEls.min, fEls.max]) el.addEventListener("input", () => applyFilters());
+document.querySelectorAll('input[name="colorBy"]').forEach((r) => r.addEventListener("change", (e) => { ui.colorBy = e.target.value; applyFilters(); }));
+$("#freset").addEventListener("click", () => {
+  fEls.airline.value = ""; fEls.type.value = ""; fEls.min.value = 0; fEls.max.value = 45000;
+  ui.colorBy = "alt"; document.querySelector('input[name="colorBy"][value="alt"]').checked = true;
+  applyFilters();
+});
+$("#fbtn").addEventListener("click", () => {
+  const f = $("#filters"), open = f.hidden;
+  f.hidden = !open;
+  $("#fbtn").setAttribute("aria-expanded", String(open));
+  if (open) refreshFilterLists();
+});
+// Suggestions: airlines and types currently on the map, most common first.
+let listsAt = 0;
+function refreshFilterLists() {
+  if ($("#filters").hidden || Date.now() - listsAt < 20000) return;
+  listsAt = Date.now();
+  const al = new Map(), ty = new Map();
+  for (const p of planes.values()) {
+    if (isAirline(p.cs)) al.set(p.cs.slice(0, 3), (al.get(p.cs.slice(0, 3)) || 0) + 1);
+    if (p.type) ty.set(p.type.toUpperCase(), (ty.get(p.type.toUpperCase()) || 0) + 1);
+  }
+  $("#airlineList").innerHTML = [...al].sort((a, b) => b[1] - a[1]).slice(0, 250)
+    .map(([k, n]) => `<option value="${esc(k)}${airlinesData?.[k] ? " · " + esc(airlinesData[k][1]) : ""}">${nf(n)} on the map</option>`).join("");
+  $("#typeList").innerHTML = [...ty].sort((a, b) => b[1] - a[1]).slice(0, 200)
+    .map(([k, n]) => `<option value="${esc(k)}">${nf(n)} on the map</option>`).join("");
+}
+// The key under the filters: altitude scale, or the airlines in view.
+let keyAt = 0, keyTop = [];
+function updateAirlineKey(inView) {
+  if (Date.now() - keyAt < 2000) return;
+  keyAt = Date.now();
+  keyTop = [...inView].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k]) => k);
+  updateLegend();
+}
+function updateLegend() {
+  const lg = $("#legend");
+  if (ui.colorBy !== "airline") {
+    if (lg.classList.contains("air")) {
+      lg.classList.remove("air");
+      lg.innerHTML = `<span>Gnd</span><span class="bar" id="lbar"></span><span>45k ft</span>`;
+      $("#lbar").style.background = LEGEND_BG;
+    }
+    return;
+  }
+  lg.classList.add("air");
+  lg.innerHTML = keyTop.length
+    ? keyTop.map((k) => `<span class="k" title="${esc(airlinesData?.[k]?.[1] || k)}"><i style="background:${airlineColor({ cs: k + "1" })}"></i>${esc(k)}</span>`).join("") + `<span class="k"><i style="background:${GROUND}"></i>Other</span>`
+    : "Airline colors appear as planes load.";
+}
+// Restore saved filters.
+try {
+  const f = JSON.parse(store.get("ft-filters") || "null");
+  if (f) {
+    fEls.airline.value = f.a || ""; fEls.type.value = f.t || "";
+    fEls.min.value = f.lo ?? 0; fEls.max.value = f.hi ?? 45000;
+    ui.colorBy = f.c === "airline" ? "airline" : "alt";
+    document.querySelector(`input[name="colorBy"][value="${ui.colorBy}"]`).checked = true;
+  }
+} catch {}
+loadAirlines().then(() => applyFilters(false));
+applyFilters(false);
+
+/* ---------- FlightAware usage meter ----------
+   Today's and this month's lookups against the limits. Reading it is free. */
+let meterU = null;
+function noteUsage(j) {
+  const u = j?.usage;
+  if (!u) return;
+  // Answers reused from cache can carry older counts; keep the higher one.
+  if (!meterU || u.month >= meterU.month || u.day >= meterU.day) { meterU = u; renderMeter(); }
+}
+async function refreshMeter() {
+  try {
+    const r = await fetch(`${API_FLIGHT}?usage=1`, { cache: "no-store" });
+    if (!(r.headers.get("content-type") || "").includes("json")) return;
+    const j = await r.json();
+    if (j.enabled && j.usage) { meterU = j.usage; renderMeter(); }
+  } catch {}
+}
+function renderMeter() {
+  const el = $("#sMeter"), u = meterU;
+  if (!u) { el.innerHTML = ""; return; }
+  const now = new Date();
+  const nextDay = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  const nextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+  const dp = u.day / u.dayLimit, mp = u.month / u.monthLimit;
+  const cls = (x) => (x >= 1 ? "full" : x >= 0.8 ? "warn" : "");
+  const bar = (x) => `<span class="mbar ${cls(x)}"><i style="width:${Math.min(100, x * 100).toFixed(0)}%"></i></span>`;
+  const note = mp >= 1
+    ? `<span class="err">Monthly limit reached, resets ${nextMonth.toLocaleDateString([], { month: "short", day: "numeric" })}</span>`
+    : dp >= 1 ? `<span class="err">Daily limit reached, resets ${fmtTime(nextDay)}</span>`
+    : `Resets ${fmtTime(nextDay)}. Flight details use 1, a full path ${u.trackUnits}.`;
+  el.innerHTML = `<div class="mrow" title="FlightAware lookups used today"><b>FlightAware</b> ${u.day}/${u.dayLimit} today ${bar(dp)}</div>
+    <div class="mrow" title="FlightAware lookups used this month">${nf(u.month)}/${nf(u.monthLimit)} this month ${bar(mp)}</div>
+    <div>${note}</div>`;
+}
+refreshMeter();
+setInterval(refreshMeter, 5 * 60e3);
 $("#theme").addEventListener("click", () => {
   setTheme(!ui.dark);
   store.set("ft-theme", ui.dark ? "dark" : "light");
