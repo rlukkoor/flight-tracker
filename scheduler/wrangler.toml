@@ -3,7 +3,9 @@ main = "worker.js"
 compatibility_date = "2026-10-01"
 
 [triggers]
-crons = ["*/2 * * * *"] # every 2 minutes; use "*/5 * * * *" if you stay on KV storage
+# Every 10 minutes. If you change this, also change SNAPSHOT_EVERY_MIN in
+# .github/workflows/opensky-snapshot.yml to the same number of minutes.
+crons = ["*/10 * * * *"]
 
 [vars]
 GITHUB_REPO = "rlukkoor/flight-tracker"

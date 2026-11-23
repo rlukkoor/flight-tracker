@@ -1,5 +1,5 @@
 // Flight tracker scheduler: a Cloudflare Worker with a cron trigger that starts
-// the GitHub snapshot workflow (every 2 minutes, set in wrangler.toml). GitHub's own scheduler is
+// the GitHub snapshot workflow (every 10 minutes, set in wrangler.toml). GitHub's own scheduler is
 // best effort and often runs late or skips runs; Cloudflare's cron is punctual.
 //
 // Deploy from this folder:  npx wrangler deploy

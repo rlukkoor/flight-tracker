@@ -1,7 +1,7 @@
 name: OpenSky snapshot
 
 on:
-  # The Cloudflare scheduler worker (scheduler/) starts this every 2 minutes.
+  # The Cloudflare scheduler worker (scheduler/) starts this every 10 minutes.
   # GitHub's own schedule is only an hourly safety net, since it often runs late.
   schedule:
     - cron: "17 * * * *"
@@ -33,3 +33,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          # Must match the cron interval in scheduler/wrangler.toml
+          SNAPSHOT_EVERY_MIN: "10"
+          # adsb.fi fill-in at most this often (minutes)
+          FILL_EVERY_MIN: "30"

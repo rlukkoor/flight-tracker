@@ -65,6 +65,10 @@ for (const k of required) {
 // adsb.fi fill-in queries take about 75 seconds, so they run at most this often;
 // in between, the last fill-in results are reused.
 const FILL_EVERY_MS = (Number(env.FILL_EVERY_MIN) || 4) * 60_000 - 30_000;
+// How often the scheduler starts this job. It's written into the snapshot so the
+// site knows how fresh to expect it and how long to keep planes moving between runs.
+// Keep it equal to the cron interval in scheduler/wrangler.toml.
+const EVERY_SEC = Math.round((Number(env.SNAPSHOT_EVERY_MIN) || 10) * 60);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const r4 = (v) => (v == null ? null : Math.round(v * 1e4) / 1e4);
@@ -334,7 +338,7 @@ const ac = [...byHex.values()];
 if (ac.length < 500) throw new Error(`only ${ac.length} aircraft, keeping the previous snapshot`);
 
 // "fetched" must stay the first key; /api/states reads it from the start of the string.
-const body = JSON.stringify({ fetched: Date.now(), time: os?.time || Math.floor(Date.now() / 1000), ac });
+const body = JSON.stringify({ fetched: Date.now(), every: EVERY_SEC, time: os?.time || Math.floor(Date.now() / 1000), ac });
 await storePut("snapshot", body);
 let tracksNote = "tracks skipped (read failed)";
 if (tracksOk) {

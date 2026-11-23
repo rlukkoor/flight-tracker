@@ -11,7 +11,7 @@ functions/api/flight.js                 FlightAware schedule, times and gates (o
 functions/api/config.js                 public settings for the page (CARTO_KEY)
 functions/api/live.js                   relay for the zoomed in live feed when the browser can't reach it
 airlines.json                           airline names and codes (OpenFlights), for logos
-scheduler/                              Cloudflare Worker that starts the snapshot job every 2 minutes
+scheduler/                              Cloudflare Worker that starts the snapshot job every 10 minutes
 airports.json                           airport names and coordinates (OurAirports), loaded on first click
 navaids.json                            radio navigation aid coordinates (OurAirports), for reading filed routes
 favicon.svg, apple-touch-icon.png       site icons
@@ -51,13 +51,16 @@ OpenSky doesn't answer Cloudflare's servers and doesn't allow browser requests f
 * Basemap: add your CARTO basemaps key as the `CARTO_KEY` environment variable in the Pages project settings (Production), then redeploy. Without it the map uses keyless Esri tiles. `index.html` never needs editing.
 * GitHub's own scheduler is best effort and often late, so the Cloudflare scheduler worker starts the job instead. GitHub's schedule remains as an hourly backup.
 * GitHub pauses the hourly backup schedule after 60 days with no commits. The Cloudflare scheduler isn't affected.
-* Credits: at every 2 minutes, about 720 OpenSky calls a day at 4 credits each uses about 2,900 of your 4,000.
+* Schedule: the snapshot job runs every 10 minutes (144 runs a day), set by the cron in `scheduler/wrangler.toml` and `SNAPSHOT_EVERY_MIN` in the workflow, which must match. Between snapshots planes keep moving along their heading, and the live feed stays real time when zoomed in or following a plane.
+* Credits: at every 10 minutes, about 144 OpenSky calls a day at 4 credits each uses about 580 of your 4,000.
 * Each run also makes about 70 adsb.fi queries, paced at one per second as its terms require, to fill regions OpenSky covers thinly. No free source covers mid ocean.
 * Storage: with R2, each run writes 2 or 3 objects, about 2,000 writes a day against R2's free 1 million a month. With KV only, keep the scheduler at every 5 minutes (about 625 writes a day of the free 1,000), and note the track history stops saving if it passes 25 MB.
-* The adsb.fi fill-in queries take about 75 seconds, so they run at most every 4 minutes (`FILL_EVERY_MIN`) and are reused in between.
+* The adsb.fi fill-in queries take about 75 seconds, so they run at most every 30 minutes (`FILL_EVERY_MIN` in the workflow) and are reused in between.
 * Airline logos load from pics.avs.io, falling back to images.kiwi.com.
 * AeroAPI's Personal tier is for personal or academic use only.
 * Data sources are free for non commercial use. Check each provider's terms before using it inside a business product.
 * URLs are shareable: `#zoom/lat/lon/hex` restores the view and selected plane, and `#zoom/lat/lon/KSAN` opens an airport.
 * Airport view: click an airport on the map (large ones from zoom 4, others from zoom 7) or search its code. Arrivals, departures and planes on the ground are worked out from positions within 120 nm, confirmed by each airline's recent routes where known.
+* Filters: airline (name or code), aircraft type (prefixes work, B73 for all 737s), altitude range, and coloring by airline. They're saved in your browser. Aircraft type is only known for planes seen by adsb.fi or the live feed.
+* FlightAware meter: shows lookups used today and this month against your limits, read from `/api/flight?usage=1`, which never contacts FlightAware.
 * Track history records altitude and ground speed, plus one point on the ground before each takeoff, which gives the altitude chart and an exact takeoff time.

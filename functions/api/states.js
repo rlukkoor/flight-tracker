@@ -124,7 +124,6 @@ let kvBody = null;
 let kvAt = 0;
 async function fromKV(env) {
   const r2 = !!env.FLIGHTS_R2;
-  const every = Number(env.SNAPSHOT_EVERY) || (r2 ? 120 : 300);
   if (!kvBody || Date.now() - kvAt > (r2 ? 15_000 : 30_000)) {
     const txt = r2
       ? await env.FLIGHTS_R2.get("snapshot").then((o) => (o ? o.text() : null))
@@ -136,6 +135,8 @@ async function fromKV(env) {
   }
   if (!kvBody) return json({ error: "No snapshot yet. Run the OpenSky snapshot action once on GitHub." }, 503);
   const fetched = Number((kvBody.slice(0, 40).match(/"fetched":(\d+)/) || [])[1] || 0);
+  // The job records how often it runs; older snapshots without it fall back to the setting.
+  const every = Number((kvBody.slice(0, 80).match(/"every":(\d+)/) || [])[1]) || Number(env.SNAPSHOT_EVERY) || (r2 ? 120 : 300);
   const lateMin = Math.round((Date.now() - fetched) / 60000);
   const stale = Date.now() - fetched > every * 3000;
   return new Response(`{"ttl":${every},"auth":true,"source":"stored",${kvBody.slice(1)}`, {
