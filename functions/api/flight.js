@@ -43,34 +43,21 @@ function pick(flights) {
 // A flight lookup counts as 1 unit. A track counts as AEROAPI_TRACK_UNITS
 // (default 3), on the cautious side; check AeroAPI's per-query price table and
 // adjust if tracks cost less.
-async function readUsage(env) {
+async function reserve(context, units) {
+  const { env } = context;
+  const monthly = Number(env.AEROAPI_MONTHLY_LIMIT) || 900;
+  const daily = Number(env.AEROAPI_DAILY_LIMIT) || 30;
   const today = new Date().toISOString().slice(0, 10), month = today.slice(0, 7);
   let u = {};
   try { u = JSON.parse((await env.FLIGHTS_KV.get("aero-usage")) || "{}"); } catch {}
   if (u.month !== month) u = { month, m: 0, day: today, d: 0 };
   if (u.day !== today) { u.day = today; u.d = 0; }
-  return u;
-}
-// For the page's usage meter (lookups are counted in units; see above).
-function usageView(u, env) {
-  return {
-    day: u.d, dayLimit: Number(env.AEROAPI_DAILY_LIMIT) || 30,
-    month: u.m, monthLimit: Number(env.AEROAPI_MONTHLY_LIMIT) || 900,
-    trackUnits: Number(env.AEROAPI_TRACK_UNITS) || 3,
-  };
-}
-async function reserve(context, units) {
-  const { env } = context;
-  const monthly = Number(env.AEROAPI_MONTHLY_LIMIT) || 900;
-  const daily = Number(env.AEROAPI_DAILY_LIMIT) || 30;
-  const u = await readUsage(env);
-  if (u.m + units > monthly) return { limited: "month", usage: usageView(u, env) };
-  if (u.d + units > daily) return { limited: "day", usage: usageView(u, env) };
+  if (u.m + units > monthly) return { limited: "month" };
+  if (u.d + units > daily) return { limited: "day" };
   return {
     commit() {
       u.m += units; u.d += units;
       context.waitUntil(env.FLIGHTS_KV.put("aero-usage", JSON.stringify(u)));
-      return usageView(u, env);
     },
   };
 }
@@ -88,7 +75,7 @@ async function track(context, faId) {
     if (hit) return hit;
   } catch {}
   const res0 = await reserve(context, Number(env.AEROAPI_TRACK_UNITS) || 3);
-  if (res0.limited) return json({ enabled: true, limited: res0.limited, usage: res0.usage });
+  if (res0.limited) return json({ enabled: true, limited: res0.limited });
   let r;
   try {
     r = await fetch(`${BASE}/flights/${encodeURIComponent(faId)}/track`, {
@@ -97,15 +84,15 @@ async function track(context, faId) {
   } catch (e) {
     return json({ enabled: true, error: `FlightAware unreachable (${e.message})` });
   }
-  const used = res0.commit();
-  if (!r.ok) return json({ enabled: true, error: `FlightAware returned ${r.status}`, usage: used });
+  res0.commit();
+  if (!r.ok) return json({ enabled: true, error: `FlightAware returned ${r.status}` });
   const d = await r.json();
   // [epochSeconds, lat, lon, altitudeFt, groundspeedKt, heading, source]
   const points = (d.positions || [])
     .filter((p) => p.latitude != null && p.longitude != null && p.update_type !== "P")
     .map((p) => [Math.round(Date.parse(p.timestamp) / 1000), p.latitude, p.longitude,
       p.altitude != null ? p.altitude * 100 : null, p.groundspeed ?? null, p.heading ?? null, p.update_type || null]);
-  const res = json({ enabled: true, points, usage: used }, 600);
+  const res = json({ enabled: true, points }, 600);
   if (cache) context.waitUntil(cache.put(key, res.clone()).catch(() => {}));
   return res;
 }
@@ -115,8 +102,6 @@ export async function onRequestGet(context) {
   if (!env.AEROAPI_KEY) return json({ enabled: false });
   if (!env.FLIGHTS_KV) return json({ enabled: true, error: "FLIGHTS_KV binding missing, so usage can't be capped" });
   const params = new URL(request.url).searchParams;
-  // GET /api/flight?usage=1: today's and this month's usage. Free: no FlightAware call.
-  if (params.get("usage")) return json({ enabled: true, usage: usageView(await readUsage(env), env) });
   const faId = (params.get("track") || "").replace(/[^A-Za-z0-9-]/g, "").slice(0, 80);
   if (faId) return track(context, faId);
   const cs = (params.get("cs") || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
@@ -131,7 +116,7 @@ export async function onRequestGet(context) {
   } catch {}
 
   const slot = await reserve(context, 1);
-  if (slot.limited) return json({ enabled: true, limited: slot.limited, usage: slot.usage });
+  if (slot.limited) return json({ enabled: true, limited: slot.limited });
 
   let r;
   try {
@@ -141,8 +126,8 @@ export async function onRequestGet(context) {
   } catch (e) {
     return json({ enabled: true, error: `FlightAware unreachable (${e.message})` });
   }
-  const used = slot.commit();
-  if (!r.ok) return json({ enabled: true, error: `FlightAware returned ${r.status}`, usage: used });
+  slot.commit();
+  if (!r.ok) return json({ enabled: true, error: `FlightAware returned ${r.status}` });
 
   const f = pick((await r.json()).flights || []);
   const flight = f && {
@@ -160,7 +145,7 @@ export async function onRequestGet(context) {
     filedSpeed: f.filed_airspeed || null, progress: f.progress_percent ?? null,
     route: f.route || null, // filed route, e.g. "ENI J589 40N140W 39N150W ..."
   };
-  const res = json({ enabled: true, flight: flight || null, trackUnits: Number(env.AEROAPI_TRACK_UNITS) || 3, usage: used }, 900);
+  const res = json({ enabled: true, flight: flight || null, trackUnits: Number(env.AEROAPI_TRACK_UNITS) || 3 }, 900);
   if (cache) context.waitUntil(cache.put(key, res.clone()).catch(() => {}));
   return res;
 }
